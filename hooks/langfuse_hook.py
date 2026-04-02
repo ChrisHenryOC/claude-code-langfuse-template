@@ -17,12 +17,20 @@ from pathlib import Path
 from typing import Any
 import socket
 
+# Prevent local directories named "langfuse" (e.g., Docker Compose project dirs)
+# from shadowing the real langfuse SDK via namespace package resolution.
+# Remove CWD and '' from sys.path temporarily during import.
+_original_path = sys.path[:]
+sys.path = [p for p in sys.path if p not in ("", ".") and Path(p).resolve() != Path.cwd().resolve()]
+
 # Check if Langfuse is available
 try:
     from langfuse import Langfuse
 except ImportError:
     print("Error: langfuse package not installed. Run: pip install langfuse", file=sys.stderr)
     sys.exit(0)
+finally:
+    sys.path = _original_path
 
 # Configuration
 LOG_FILE = Path.home() / ".claude" / "state" / "langfuse_hook.log"
@@ -30,6 +38,7 @@ STATE_FILE = Path.home() / ".claude" / "state" / "langfuse_state.json"
 QUEUE_FILE = Path.home() / ".claude" / "state" / "pending_traces.jsonl"
 DEBUG = os.environ.get("CC_LANGFUSE_DEBUG", "").lower() == "true"
 HEALTH_CHECK_TIMEOUT = 2  # seconds
+PERMISSION_EVENTS_FILE = Path.home() / ".claude" / "logs" / "permission-events.jsonl"
 
 
 def log(level: str, message: str) -> None:
@@ -456,6 +465,23 @@ def queue_turns_from_messages(
     return turns
 
 
+def get_permission_flags(session_id: str) -> list[dict]:
+    """Read flagged permission events for the current session."""
+    if not PERMISSION_EVENTS_FILE.exists():
+        return []
+    events = []
+    try:
+        for line in PERMISSION_EVENTS_FILE.read_text().strip().split("\n"):
+            if not line:
+                continue
+            event = json.loads(line)
+            if event.get("session_id") == session_id:
+                events.append(event)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return events
+
+
 def create_trace(
     langfuse: Langfuse,
     session_id: str,
@@ -557,6 +583,22 @@ def create_trace(
             ) as tool_span:
                 tool_span.update(output=tool_call["output"])
             debug(f"Created span for tool: {tool_call['name']}")
+
+        # Add permission governance data
+        perm_events = get_permission_flags(session_id)
+        if perm_events:
+            tags.append("has-permission-flags")
+            langfuse.update_current_trace(tags=tags)
+            flag_summary = {}
+            for evt in perm_events:
+                for flag in evt.get("flags", []):
+                    flag_summary[flag] = flag_summary.get(flag, 0) + 1
+            with langfuse.start_as_current_span(
+                name="Permission Events",
+                input={"flagged_event_count": len(perm_events), "flag_summary": flag_summary},
+                metadata={"source": "claude-governance"},
+            ) as perm_span:
+                perm_span.update(output={"events": perm_events})
 
         # Update trace with output
         trace_span.update(output={"role": "assistant", "content": final_output})
