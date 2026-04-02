@@ -3,7 +3,8 @@
     "TRACE_TO_LANGFUSE": "true",
     "LANGFUSE_PUBLIC_KEY": "pk-lf-local-claude-code",
     "LANGFUSE_SECRET_KEY": "YOUR_SECRET_KEY_HERE",
-    "LANGFUSE_HOST": "http://localhost:3050"
+    "LANGFUSE_HOST": "http://localhost:3050",
+    "OTEL_LOG_TOOL_DETAILS": "1"
   },
   "hooks": {
     "Stop": [
