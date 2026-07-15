@@ -11,6 +11,7 @@ automatically drained on the next successful connection.
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,11 +40,43 @@ QUEUE_FILE = Path.home() / ".claude" / "state" / "pending_traces.jsonl"
 DEBUG = os.environ.get("CC_LANGFUSE_DEBUG", "").lower() == "true"
 HEALTH_CHECK_TIMEOUT = 2  # seconds
 PERMISSION_EVENTS_FILE = Path.home() / ".claude" / "logs" / "permission-events.jsonl"
+LOG_MAX_SIZE_BYTES = 10 * 1024 * 1024  # 10MB max log size
+LOG_BACKUP_COUNT = 3  # Keep 3 rotated logs
+REDACT_SECRETS = os.environ.get("CC_LANGFUSE_REDACT", "true").lower() == "true"
+
+# Patterns for secret redaction (conservative - only obvious secrets)
+SECRET_PATTERNS = [
+    (r'sk-[a-zA-Z0-9]{20,}', 'sk-[REDACTED]'),  # OpenAI/Anthropic keys
+    (r'sk-lf-[a-zA-Z0-9-]{20,}', 'sk-lf-[REDACTED]'),  # Langfuse keys
+    (r'Bearer [a-zA-Z0-9._-]{20,}', 'Bearer [REDACTED]'),  # Bearer tokens
+    (r'token["\']?\s*[:=]\s*["\']?[a-zA-Z0-9._-]{20,}', 'token: [REDACTED]'),  # Generic tokens
+    (r'password["\']?\s*[:=]\s*["\']?[^\s"\']{8,}', 'password: [REDACTED]'),  # Passwords
+    (r'api[_-]?key["\']?\s*[:=]\s*["\']?[a-zA-Z0-9._-]{16,}', 'api_key: [REDACTED]'),  # API keys
+]
+
+
+def rotate_log_if_needed() -> None:
+    """Rotate log file if it exceeds max size."""
+    if not LOG_FILE.exists():
+        return
+    try:
+        if LOG_FILE.stat().st_size > LOG_MAX_SIZE_BYTES:
+            # Rotate existing backups
+            for i in range(LOG_BACKUP_COUNT - 1, 0, -1):
+                old = LOG_FILE.with_suffix(f".log.{i}")
+                new = LOG_FILE.with_suffix(f".log.{i + 1}")
+                if old.exists():
+                    old.rename(new)
+            # Rotate current log
+            LOG_FILE.rename(LOG_FILE.with_suffix(".log.1"))
+    except (IOError, OSError):
+        pass  # Ignore rotation errors
 
 
 def log(level: str, message: str) -> None:
     """Log a message to the log file."""
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    rotate_log_if_needed()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a") as f:
         f.write(f"{timestamp} [{level}] {message}\n")
@@ -53,6 +86,33 @@ def debug(message: str) -> None:
     """Log a debug message (only if DEBUG is enabled)."""
     if DEBUG:
         log("DEBUG", message)
+
+
+def sanitize_text(text: str) -> str:
+    """Redact potential secrets from text content.
+
+    This applies conservative patterns to avoid sending API keys,
+    passwords, and tokens to Langfuse. Can be disabled by setting
+    CC_LANGFUSE_REDACT=false.
+    """
+    if not REDACT_SECRETS or not text:
+        return text
+
+    result = text
+    for pattern, replacement in SECRET_PATTERNS:
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+    return result
+
+
+def sanitize_value(value: Any) -> Any:
+    """Recursively sanitize a value (string, dict, or list)."""
+    if isinstance(value, str):
+        return sanitize_text(value)
+    elif isinstance(value, dict):
+        return {k: sanitize_value(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [sanitize_value(item) for item in value]
+    return value
 
 
 def check_langfuse_health(host: str) -> bool:
@@ -491,14 +551,31 @@ def create_trace(
     tool_results: list,
     project_name: str = "",
 ) -> None:
-    """Create a Langfuse trace for a single turn using the new SDK API."""
+    """Add one conversation turn to the session's single Langfuse trace.
+
+    All turns in a Claude Code session share ONE trace, keyed by a
+    deterministic trace id derived from the session id. Each turn becomes a
+    top-level span under that trace, with the Claude response as a nested
+    generation and each tool call as a nested span:
+
+        Trace (session)
+          Turn 1 (span)
+            Claude Response (generation)
+            Tool: Bash (span)
+          Turn 2 (span)
+            ...
+
+    Because the trace id is seeded from the session id, every incremental
+    hook run (this is a Stop hook, firing once per turn) appends to the same
+    trace instead of creating a new one.
+    """
     # Extract user text
-    user_text = get_text_content(user_msg)
+    user_text = sanitize_text(get_text_content(user_msg))
 
     # Extract final assistant text
     final_output = ""
     if assistant_msgs:
-        final_output = get_text_content(assistant_msgs[-1])
+        final_output = sanitize_text(get_text_content(assistant_msgs[-1]))
 
     # Get model info from first assistant message
     model = "claude"
@@ -526,8 +603,8 @@ def create_trace(
 
             all_tool_calls.append({
                 "name": tool_name,
-                "input": tool_input,
-                "output": tool_output,
+                "input": sanitize_value(tool_input),
+                "output": sanitize_value(tool_output),
                 "id": tool_id,
             })
 
@@ -536,27 +613,33 @@ def create_trace(
     if project_name:
         tags.append(project_name)
 
-    # Create root span (implicitly creates a trace), then set trace-level attributes
+    # Deterministic trace id: same session id -> same trace across hook runs.
+    trace_id = langfuse.create_trace_id(seed=session_id)
+    trace_name = f"{project_name} [{session_id[:8]}]" if project_name else f"session {session_id[:8]}"
+
+    # Attach this turn as a top-level span on the shared session trace.
     with langfuse.start_as_current_span(
+        trace_context={"trace_id": trace_id},
         name=f"Turn {turn_num}",
         input={"role": "user", "content": user_text},
-        metadata={
-            "source": "claude-code",
-            "turn_number": turn_num,
-            "project": project_name,
-        },
+        metadata={"turn_number": turn_num},
     ) as trace_span:
-        # Set session_id and tags on the underlying trace
-        langfuse.update_current_trace(
-            session_id=session_id,
-            tags=tags,
-            metadata={
+        # Set (idempotent) session-level attributes on the underlying trace.
+        trace_attrs = {
+            "name": trace_name,
+            "session_id": session_id,
+            "tags": tags,
+            "metadata": {
                 "source": "claude-code",
-                "turn_number": turn_num,
                 "session_id": session_id,
                 "project": project_name,
             },
-        )
+            "output": {"role": "assistant", "content": final_output},
+        }
+        # Trace-level input is the session's first prompt.
+        if turn_num == 1:
+            trace_attrs["input"] = {"role": "user", "content": user_text}
+        langfuse.update_current_trace(**trace_attrs)
 
         # Create generation for the LLM response
         with langfuse.start_as_current_observation(
@@ -600,10 +683,10 @@ def create_trace(
             ) as perm_span:
                 perm_span.update(output={"events": perm_events})
 
-        # Update trace with output
+        # Update the turn span with its final output
         trace_span.update(output={"role": "assistant", "content": final_output})
 
-    debug(f"Created trace for turn {turn_num}")
+    debug(f"Added turn {turn_num} to session trace {trace_id}")
 
 
 def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Path, state: dict, project_name: str = "") -> int:
