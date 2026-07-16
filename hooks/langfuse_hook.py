@@ -39,6 +39,11 @@ finally:
 # Configuration
 LOG_FILE = Path.home() / ".claude" / "state" / "langfuse_hook.log"
 STATE_FILE = Path.home() / ".claude" / "state" / "langfuse_state.json"
+
+# How long a subagent transcript must sit unmodified before we treat it as
+# finished. Async subagents are appended to for as long as they run; emitting
+# early is unrecoverable (see subagent_is_complete).
+SUBAGENT_QUIESCE_SECONDS = 60
 QUEUE_FILE = Path.home() / ".claude" / "state" / "pending_traces.jsonl"
 DEBUG = os.environ.get("CC_LANGFUSE_DEBUG", "").lower() == "true"
 HEALTH_CHECK_TIMEOUT = 2  # seconds
@@ -289,6 +294,108 @@ def merge_assistant_parts(parts: list) -> dict:
     return result
 
 
+def merge_by_message_id(records: list) -> list:
+    """Collapse assistant records that belong to the same API call.
+
+    Claude Code writes one record per content block (thinking, text, each
+    tool_use), and every one of them repeats the SAME `message.usage`. Treating
+    them as separate calls inflates token counts ~2.2-2.8x. Group by
+    `message.id` and merge; records without an id stand alone.
+    """
+    groups: list[list] = []
+    by_id: dict[str, list] = {}
+    for r in records:
+        mid = (r.get("message") or {}).get("id")
+        if not mid:
+            groups.append([r])
+            continue
+        if mid in by_id:
+            by_id[mid].append(r)
+        else:
+            group = [r]
+            by_id[mid] = group
+            groups.append(group)
+    return [merge_assistant_parts(g) for g in groups]
+
+
+def has_task_notification(parent_transcript: Path | str | None, agent_id: str) -> bool:
+    """True when the parent transcript carries a <task-notification> for agent_id.
+
+    This is Claude Code's definitive "subagent finished" signal, but it is not
+    always emitted (observed 3/8 on one session, 8/8 on another), so it is only
+    ever used as a fast path — never as the sole completion test.
+    """
+    if not parent_transcript or not agent_id:
+        return False
+    try:
+        return f"<task-id>{agent_id}</task-id>" in Path(parent_transcript).read_text(errors="ignore")
+    except OSError:
+        return False
+
+
+def subagent_is_complete(jsonl_path: Path, parent_transcript=None, agent_id: str = "") -> bool:
+    """True when a subagent transcript has stopped growing and is safe to emit.
+
+    Since Claude Code ~v2.1.196 the Agent tool is ASYNC: the parent's tool_result
+    is only a spawn acknowledgement ("Async agent launched successfully"), so the
+    file is still being appended to when the spawning turn is finalized. Emitting
+    then captures a fraction of the subagent's calls, and because observation ids
+    cannot be pinned in the Langfuse v3 SDK, an early emit cannot be corrected
+    later without duplicating. So require quiescence, accepting a notification as
+    proof of completion when one exists.
+    """
+    try:
+        idle = time.time() - jsonl_path.stat().st_mtime
+    except OSError:
+        return False
+    if idle >= SUBAGENT_QUIESCE_SECONDS:
+        return True
+    return has_task_notification(parent_transcript, agent_id)
+
+
+def subagent_by_id(parent_transcript: Path | str | None, agent_id: str) -> dict | None:
+    """Build subagent info straight from an agentId, bypassing description matching."""
+    if not parent_transcript or not agent_id:
+        return None
+    p = Path(parent_transcript)
+    subagent_dir = p.parent / p.stem / "subagents"
+    jsonl_path = subagent_dir / f"agent-{agent_id}.jsonl"
+    if not jsonl_path.exists():
+        return None
+    meta = {}
+    try:
+        meta = json.loads((subagent_dir / f"agent-{agent_id}.meta.json").read_text())
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {
+        "path": jsonl_path,
+        "agent_type": meta.get("agentType", "unknown"),
+        "agent_id": agent_id,
+        "description": meta.get("description", ""),
+    }
+
+
+def resolve_subagent(subagents: dict, desc: str, agent_id: str, parent_transcript) -> dict | None:
+    """Resolve an Agent tool_use to its subagent, preferring the agentId link."""
+    return subagent_by_id(parent_transcript, agent_id) or subagents.get(desc) or next(
+        (v for k, v in subagents.items() if k.startswith(f"{desc}#")), None
+    )
+
+
+def agent_id_from_result(raw_result: Any) -> str:
+    """Pull `agentId: <id>` out of an async Agent tool_result (the spawn ack).
+
+    This links a tool_use to its subagent by id rather than by free-text
+    description, which is what makes attribution robust.
+    """
+    try:
+        text = json.dumps(raw_result)
+    except (TypeError, ValueError):
+        return ""
+    m = re.search(r"agentId:\s*([A-Za-z0-9_-]+)", text)
+    return m.group(1) if m else ""
+
+
 # ─── v2 logging helpers ────────────────────────────────────────────────────
 # All helpers below contribute to per-API-call generations, real cost
 # attribution (incl. cache tokens), subagent expansion, and trace metadata.
@@ -496,6 +603,7 @@ def emit_subagent_span(
     subagent_info: dict,
     parent_tool_use: dict,
     parent_tool_result: Any,
+    trace_id: str | None = None,
 ) -> None:
     """Replay a subagent's transcript as a nested span under the parent's
     Agent tool_use, with one GENERATION per subagent API call plus child
@@ -517,7 +625,9 @@ def emit_subagent_span(
     except OSError:
         records = []
 
-    asst_msgs = [r for r in records if (r.get("type") or (r.get("message") or {}).get("role")) == "assistant"]
+    asst_msgs = merge_by_message_id(
+        [r for r in records if (r.get("type") or (r.get("message") or {}).get("role")) == "assistant"]
+    )
     tool_results = [r for r in records if (r.get("type") or (r.get("message") or {}).get("role")) == "user" and is_tool_result(r)]
 
     total_in = total_cache_r = total_cache_c = total_out = 0
@@ -546,6 +656,7 @@ def emit_subagent_span(
     }
 
     with langfuse.start_as_current_span(
+        trace_context={"trace_id": trace_id} if trace_id else None,
         name=f"Tool: Agent ({agent_type})",
         input=redact(truncate(parent_tool_use.get("input"))),
         output=redact(truncate(parent_output)),
@@ -869,14 +980,21 @@ def create_trace(
     tool_results: list,
     project_name: str = "",
     transcript_path: str | Path | None = None,
-) -> None:
+    emitted_ids: set | None = None,
+) -> list:
     """Create a Langfuse trace for a single turn (v2 schema).
 
     Emits one GENERATION per assistant API call with real Anthropic-reported
     usage (incl. cache tokens), expands Agent tool_use blocks into nested
     subagent observations, marks errored tools at level=ERROR, and sets
     user_id / release / semantic trace name.
+
+    Returns one outcome dict per Agent tool_use — either {"status": "emitted"}
+    or {"status": "pending", ...} for a subagent that was still running. The
+    caller records these so the sweep can finish the pending ones exactly once.
     """
+    emitted_ids = emitted_ids or set()
+    subagent_outcomes: list = []
     user_text = get_text_content(user_msg)
     final_text = get_text_content(assistant_msgs[-1]) if assistant_msgs else ""
 
@@ -982,26 +1100,45 @@ def create_trace(
                 tool_id = tu.get("id", "")
                 raw_result = _find_tool_result(tool_id, tool_results)
 
-                # Subagent expansion: when tool is Agent, look up the matching
-                # subagent transcript by description and emit nested observations.
+                # Subagent expansion: when tool is Agent, resolve the subagent —
+                # by agentId from the tool_result when present, else by
+                # description — and emit its transcript as nested observations.
+                # Async subagents are usually still running here, so anything
+                # unfinished is deferred to the sweep rather than emitted partial.
                 if tool_name == "Agent":
                     desc = (tu.get("input") or {}).get("description", "")
-                    sub = subagents.get(desc) or next(
-                        (v for k, v in subagents.items() if k.startswith(f"{desc}#")),
-                        None,
+                    sub = resolve_subagent(
+                        subagents, desc, agent_id_from_result(raw_result), transcript_path
                     )
                     if sub:
-                        try:
-                            emit_subagent_span(
-                                langfuse,
-                                subagent_info=sub,
-                                parent_tool_use=tu,
-                                parent_tool_result=raw_result,
-                            )
+                        agent_id = sub["agent_id"]
+                        if agent_id in emitted_ids:
                             continue
-                        except Exception as e:
-                            debug(f"subagent expansion failed for {desc!r}: {e}")
-                            # Fall through to leaf span
+                        if subagent_is_complete(sub["path"], transcript_path, agent_id):
+                            try:
+                                emit_subagent_span(
+                                    langfuse,
+                                    subagent_info=sub,
+                                    parent_tool_use=tu,
+                                    parent_tool_result=raw_result,
+                                )
+                                subagent_outcomes.append({"status": "emitted", "agent_id": agent_id})
+                                continue
+                            except Exception as e:
+                                debug(f"subagent expansion failed for {desc!r}: {e}")
+                                # Fall through to leaf span
+                        else:
+                            subagent_outcomes.append({
+                                "status": "pending",
+                                "agent_id": agent_id,
+                                "trace_id": langfuse.get_current_trace_id(),
+                                "path": str(sub["path"]),
+                                "agent_type": sub["agent_type"],
+                                "description": sub["description"],
+                                "parent_transcript": str(transcript_path or ""),
+                                "tool_use": tu,
+                            })
+                            debug(f"subagent {agent_id} still running; deferred to sweep")
 
                 tool_is_error = isinstance(raw_result, dict) and raw_result.get("_error") is True
                 with langfuse.start_as_current_span(
@@ -1038,6 +1175,74 @@ def create_trace(
         trace_span.update(output={"role": "assistant", "content": final_text})
 
     debug(f"Created trace for turn {turn_num} ({len(assistant_msgs)} API calls, {len(subagents)} subagents)")
+    return subagent_outcomes
+
+
+def sweep_pending_subagents(langfuse: Langfuse, state: dict) -> int:
+    """Emit subagents that were still running when their spawning turn was traced.
+
+    Runs every fire over every session with pending work — deliberately NOT
+    limited to sessions whose parent transcript changed, because an async
+    subagent finishing does not necessarily touch the parent at all.
+
+    Exactly-once is enforced here, via `emitted_subagents` in the state file. The
+    Langfuse v3 SDK generates observation ids from OpenTelemetry and gives no way
+    to pin them, so a re-emit is a duplicate rather than an upsert; this
+    bookkeeping is the only thing preventing that.
+    """
+    emitted = 0
+    for session_id, sess in list(state.items()):
+        if not isinstance(sess, dict):
+            continue
+        pending = sess.get("pending_subagents") or {}
+        if not pending:
+            continue
+        done = set(sess.get("emitted_subagents") or [])
+        for agent_id, info in list(pending.items()):
+            if agent_id in done:
+                pending.pop(agent_id, None)
+                continue
+            path = Path(info.get("path", ""))
+            if not subagent_is_complete(path, info.get("parent_transcript"), agent_id):
+                continue
+            try:
+                emit_subagent_span(
+                    langfuse,
+                    subagent_info={
+                        "path": path,
+                        "agent_type": info.get("agent_type", "unknown"),
+                        "agent_id": agent_id,
+                        "description": info.get("description", ""),
+                    },
+                    parent_tool_use=info.get("tool_use") or {},
+                    parent_tool_result=None,
+                    trace_id=info.get("trace_id"),
+                )
+            except Exception as e:
+                log("WARN", f"sweep: could not emit subagent {agent_id}: {e}")
+                continue
+            done.add(agent_id)
+            pending.pop(agent_id, None)
+            emitted += 1
+        sess["emitted_subagents"] = sorted(done)
+        sess["pending_subagents"] = pending
+    if emitted:
+        save_state(state)
+        log("INFO", f"sweep: emitted {emitted} completed subagent(s)")
+    return emitted
+
+
+def record_subagent_outcomes(outcomes: list, emitted_ids: set, pending: dict) -> None:
+    """Fold create_trace's per-Agent outcomes into this session's bookkeeping."""
+    for o in outcomes or []:
+        agent_id = o.get("agent_id")
+        if not agent_id:
+            continue
+        if o.get("status") == "emitted":
+            emitted_ids.add(agent_id)
+            pending.pop(agent_id, None)
+        elif agent_id not in emitted_ids:
+            pending[agent_id] = {k: v for k, v in o.items() if k != "status"}
 
 
 def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Path, state: dict, project_name: str = "") -> int:
@@ -1046,6 +1251,8 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
     session_state = state.get(session_id, {})
     last_line = session_state.get("last_line", 0)
     turn_count = session_state.get("turn_count", 0)
+    emitted_ids = set(session_state.get("emitted_subagents") or [])
+    pending_subagents = dict(session_state.get("pending_subagents") or {})
 
     # Read transcript
     lines = transcript_file.read_text().strip().split("\n")
@@ -1096,7 +1303,10 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
             if current_user and current_assistants:
                 turns += 1
                 turn_num = turn_count + turns
-                create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results, project_name, transcript_path=str(transcript_file))
+                record_subagent_outcomes(
+                    create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results, project_name, transcript_path=str(transcript_file), emitted_ids=emitted_ids),
+                    emitted_ids, pending_subagents,
+                )
 
             # Start new turn
             current_user = msg
@@ -1134,13 +1344,19 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
     if current_user and current_assistants:
         turns += 1
         turn_num = turn_count + turns
-        create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results, project_name, transcript_path=str(transcript_file))
+        record_subagent_outcomes(
+            create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results, project_name, transcript_path=str(transcript_file), emitted_ids=emitted_ids),
+            emitted_ids, pending_subagents,
+        )
 
-    # Update state
+    # Update state. emitted/pending subagents must survive this write — losing
+    # them either strands a subagent forever or re-emits it as a duplicate.
     state[session_id] = {
         "last_line": total_lines,
         "turn_count": turn_count + turns,
         "updated": datetime.now(timezone.utc).isoformat(),
+        "emitted_subagents": sorted(emitted_ids),
+        "pending_subagents": pending_subagents,
     }
     save_state(state)
 
@@ -1263,12 +1479,16 @@ def main():
                 debug(traceback.format_exc())
                 continue
 
+        # Emit any subagents that have finished since a previous fire. Runs over
+        # every session with pending work, not just the modified ones.
+        swept = sweep_pending_subagents(langfuse, state)
+
         # Flush to ensure all data is sent
         langfuse.flush()
 
         # Log execution time
         duration = (datetime.now() - script_start).total_seconds()
-        log("INFO", f"Processed {total_turns} turns from {len(modified_transcripts)} sessions (drained {drained} from queue) in {duration:.1f}s")
+        log("INFO", f"Processed {total_turns} turns from {len(modified_transcripts)} sessions (drained {drained} from queue, swept {swept} subagents) in {duration:.1f}s")
 
         if duration > 180:
             log("WARN", f"Hook took {duration:.1f}s (>3min), consider optimizing")
