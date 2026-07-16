@@ -9,13 +9,17 @@ Resilience: If Langfuse is unavailable, traces are queued locally and
 automatically drained on the next successful connection.
 """
 
+import getpass
+import hashlib
 import json
 import os
+import re
+import socket
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-import socket
 
 # Prevent local directories named "langfuse" (e.g., Docker Compose project dirs)
 # from shadowing the real langfuse SDK via namespace package resolution.
@@ -39,6 +43,19 @@ QUEUE_FILE = Path.home() / ".claude" / "state" / "pending_traces.jsonl"
 DEBUG = os.environ.get("CC_LANGFUSE_DEBUG", "").lower() == "true"
 HEALTH_CHECK_TIMEOUT = 2  # seconds
 PERMISSION_EVENTS_FILE = Path.home() / ".claude" / "logs" / "permission-events.jsonl"
+
+# OTel resource attribute (replaces the default "unknown_service")
+SERVICE_NAME = "claude-code-hook"
+
+# Conservative key-name patterns for redacting tool inputs/outputs. Only redacts
+# values whose KEY matches; doesn't scan free-text bodies.
+SECRET_KEY_PATTERNS = [
+    re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|credential)"),
+    re.compile(r"(?i)(_KEY|_SECRET|_TOKEN)$"),
+]
+
+# Truncate large tool inputs/outputs (chars). None disables.
+TOOL_IO_MAX_CHARS = 20_000
 
 
 def log(level: str, message: str) -> None:
@@ -146,6 +163,7 @@ def drain_queue(langfuse: Langfuse) -> int:
                 assistant_msgs=trace_data["assistant_msgs"],
                 tool_results=trace_data["tool_results"],
                 project_name=trace_data.get("project_name", ""),
+                transcript_path=trace_data.get("transcript_path"),
             )
             drained += 1
         except Exception as e:
@@ -226,7 +244,13 @@ def get_text_content(msg: dict) -> str:
 
 
 def merge_assistant_parts(parts: list) -> dict:
-    """Merge multiple assistant message parts into one."""
+    """Merge multiple assistant message parts into one.
+
+    For streaming responses split across multiple JSONL records, Anthropic's
+    final usage/stop_reason lands on the LAST chunk. We merge content from all
+    parts but adopt the last non-empty `usage` and `stop_reason` so cost/token
+    metrics reflect reality.
+    """
     if not parts:
         return {}
 
@@ -238,15 +262,367 @@ def merge_assistant_parts(parts: list) -> dict:
         elif content:
             merged_content.append({"type": "text", "text": str(content)})
 
-    # Use the structure from the first part
+    # Use the structure from the first part as the envelope
     result = parts[0].copy()
     if "message" in result:
         result["message"] = result["message"].copy()
         result["message"]["content"] = merged_content
+        # Pull the final usage / stop_reason from the latest part that has them.
+        for part in reversed(parts):
+            if not isinstance(part, dict):
+                continue
+            pmsg = part.get("message") or {}
+            if isinstance(pmsg, dict):
+                if pmsg.get("usage"):
+                    result["message"]["usage"] = pmsg["usage"]
+                    break
+        for part in reversed(parts):
+            if not isinstance(part, dict):
+                continue
+            pmsg = part.get("message") or {}
+            if isinstance(pmsg, dict) and pmsg.get("stop_reason"):
+                result["message"]["stop_reason"] = pmsg["stop_reason"]
+                break
     else:
         result["content"] = merged_content
 
     return result
+
+
+# ─── v2 logging helpers ────────────────────────────────────────────────────
+# All helpers below contribute to per-API-call generations, real cost
+# attribution (incl. cache tokens), subagent expansion, and trace metadata.
+
+_RELEASE_CACHE: dict[str, str] = {}
+
+
+def derive_release(transcript_path: str | Path | None = None) -> str:
+    """Resolve Claude Code release tag, e.g. 'cc2.1.133'.
+
+    Priority:
+      1. `version` field embedded in the transcript records (most accurate
+         per-session — Stop hooks don't inherit CLAUDE_CODE_EXECPATH).
+      2. CLAUDE_CODE_EXECPATH env var, when the hook was invoked with it.
+      3. Resolve the `claude` binary's symlink target (gives the latest
+         installed version).
+      4. Final fallback: 'cc-unknown'.
+    """
+    cache_key = str(transcript_path) if transcript_path else "<global>"
+    if (cached := _RELEASE_CACHE.get(cache_key)):
+        return cached
+
+    # 1. Transcript record-level version
+    if transcript_path:
+        try:
+            with open(transcript_path, "r") as fh:
+                for i, ln in enumerate(fh):
+                    if i > 30:
+                        break
+                    try:
+                        rec = json.loads(ln)
+                    except json.JSONDecodeError:
+                        continue
+                    v = rec.get("version")
+                    if v:
+                        result = f"cc{v}"
+                        _RELEASE_CACHE[cache_key] = result
+                        return result
+        except (OSError, ValueError):
+            pass
+
+    # 2. CLAUDE_CODE_EXECPATH (set in interactive Claude env, often missing in hooks)
+    execpath = os.environ.get("CLAUDE_CODE_EXECPATH", "")
+    if (m := re.search(r"versions/(\d+\.\d+\.\d+)", execpath)):
+        result = f"cc{m.group(1)}"
+        _RELEASE_CACHE[cache_key] = result
+        return result
+
+    # 3. Resolve `claude` binary symlink → latest installed version
+    try:
+        import shutil
+        bin_path = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
+        real_path = os.path.realpath(bin_path)
+        if (m := re.search(r"versions/(\d+\.\d+\.\d+)", real_path)):
+            result = f"cc{m.group(1)}"
+            _RELEASE_CACHE[cache_key] = result
+            return result
+    except OSError:
+        pass
+
+    _RELEASE_CACHE[cache_key] = "cc-unknown"
+    return "cc-unknown"
+
+
+def derive_trace_name(user_msg: dict, turn_num: int, max_chars: int = 80) -> str:
+    """Trace names should carry semantic content, not just `Turn N`."""
+    text = get_text_content(user_msg).strip()
+    if not text:
+        return f"Turn {turn_num}"
+    first_line = text.splitlines()[0].strip()
+    snippet = first_line[:max_chars]
+    if len(first_line) > max_chars:
+        snippet = snippet.rstrip() + "…"
+    return f"T{turn_num}: {snippet}"
+
+
+def extract_usage_details(usage: dict) -> dict[str, int]:
+    """Map Anthropic API usage to Langfuse usage_details using the canonical
+    key names that Langfuse's model price table is keyed on.
+
+    Cache reads dominate Claude Code's token economy; surfacing each tier
+    separately (5m vs 1h) is what makes Langfuse's price table compute the
+    fully accurate billed cost. Anthropic charges different rates for the
+    two cache TTLs.
+
+    Output keys (chosen to literally match Langfuse's model.prices map):
+      input                          → uncached input
+      output                         → completion
+      cache_read_input_tokens        → cached reads (10% of base input price)
+      input_cache_creation_5m        → 5-minute cache writes (1.25× base)
+      input_cache_creation_1h        → 1-hour cache writes (2× base)
+    """
+    if not isinstance(usage, dict):
+        return {}
+    out: dict[str, int] = {}
+    if (v := usage.get("input_tokens")) is not None:
+        out["input"] = int(v)
+    if (v := usage.get("output_tokens")) is not None:
+        out["output"] = int(v)
+    if (v := usage.get("cache_read_input_tokens")) is not None:
+        out["cache_read_input_tokens"] = int(v)
+
+    # Cache creation: prefer the per-TTL breakdown so 5m and 1h price separately
+    cache_creation = usage.get("cache_creation") or {}
+    five_min = cache_creation.get("ephemeral_5m_input_tokens")
+    one_hour = cache_creation.get("ephemeral_1h_input_tokens")
+    if five_min is not None or one_hour is not None:
+        if five_min is not None:
+            out["input_cache_creation_5m"] = int(five_min)
+        if one_hour is not None:
+            out["input_cache_creation_1h"] = int(one_hour)
+    elif (v := usage.get("cache_creation_input_tokens")) is not None:
+        # Fall back to aggregate when the breakdown isn't provided
+        out["cache_creation_input_tokens"] = int(v)
+
+    if out:
+        out["total"] = sum(v for k, v in out.items() if k != "total")
+    return out
+
+
+def extract_model_parameters(message: dict) -> dict[str, Any]:
+    """Capture useful model parameters from the assistant message envelope."""
+    if not isinstance(message, dict):
+        return {}
+    params: dict[str, Any] = {}
+    for k in ("temperature", "max_tokens", "top_p", "top_k", "stop_sequences",
+              "service_tier", "thinking"):
+        if k in message and message[k] is not None:
+            v = message[k]
+            if isinstance(v, (str, int, bool, float)):
+                params[k] = v
+            elif isinstance(v, list):
+                params[k] = [str(x) for x in v[:10]]
+            else:
+                params[k] = json.dumps(v)[:200]
+    usage = message.get("usage") or {}
+    if (st := usage.get("service_tier")):
+        params.setdefault("service_tier", st)
+    return params
+
+
+def redact(value: Any) -> Any:
+    """Lightweight key-name-based redaction for tool inputs/outputs."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if isinstance(k, str) and any(p.search(k) for p in SECRET_KEY_PATTERNS):
+                out[k] = "<redacted>"
+            else:
+                out[k] = redact(v)
+        return out
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    return value
+
+
+def truncate(value: Any, limit: int | None = TOOL_IO_MAX_CHARS) -> Any:
+    if limit is None or value is None:
+        return value
+    s = value if isinstance(value, str) else json.dumps(value, default=str)
+    if len(s) <= limit:
+        return value
+    return s[:limit] + f"\n…[truncated {len(s) - limit} chars]"
+
+
+def discover_subagents(parent_transcript: Path | str | None) -> dict[str, dict]:
+    """Map subagent description → {path, agent_type, agent_id}.
+
+    Subagents live at <project>/<session-uuid>/subagents/agent-<id>.jsonl with
+    a sibling agent-<id>.meta.json containing {agentType, description}.
+    Returns {} when there are no subagents (the common case).
+    """
+    if not parent_transcript:
+        return {}
+    p = Path(parent_transcript)
+    subagent_dir = p.parent / p.stem / "subagents"
+    if not subagent_dir.exists():
+        return {}
+    out: dict[str, dict] = {}
+    for meta_path in subagent_dir.glob("agent-*.meta.json"):
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        agent_id = meta_path.stem.removesuffix(".meta")
+        jsonl_path = subagent_dir / f"{agent_id}.jsonl"
+        if not jsonl_path.exists():
+            continue
+        desc = meta.get("description", "")
+        if not desc:
+            continue
+        key = desc if desc not in out else f"{desc}#{agent_id}"
+        out[key] = {
+            "path": jsonl_path,
+            "agent_type": meta.get("agentType", "unknown"),
+            "agent_id": agent_id,
+            "description": desc,
+        }
+    return out
+
+
+def emit_subagent_span(
+    langfuse: Langfuse,
+    *,
+    subagent_info: dict,
+    parent_tool_use: dict,
+    parent_tool_result: Any,
+) -> None:
+    """Replay a subagent's transcript as a nested span under the parent's
+    Agent tool_use, with one GENERATION per subagent API call plus child
+    spans for the subagent's own tool calls."""
+    transcript_path: Path = subagent_info["path"]
+    agent_type = subagent_info["agent_type"]
+    agent_id = subagent_info["agent_id"]
+    description = subagent_info["description"]
+
+    records = []
+    try:
+        for ln in transcript_path.read_text().split("\n"):
+            if not ln:
+                continue
+            try:
+                records.append(json.loads(ln))
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        records = []
+
+    asst_msgs = [r for r in records if (r.get("type") or (r.get("message") or {}).get("role")) == "assistant"]
+    tool_results = [r for r in records if (r.get("type") or (r.get("message") or {}).get("role")) == "user" and is_tool_result(r)]
+
+    total_in = total_cache_r = total_cache_c = total_out = 0
+    for r in asst_msgs:
+        u = (r.get("message") or {}).get("usage") or {}
+        total_in += u.get("input_tokens", 0) or 0
+        total_cache_r += u.get("cache_read_input_tokens", 0) or 0
+        total_cache_c += u.get("cache_creation_input_tokens", 0) or 0
+        total_out += u.get("output_tokens", 0) or 0
+
+    is_error = isinstance(parent_tool_result, dict) and parent_tool_result.get("_error") is True
+    parent_output = parent_tool_result.get("content") if is_error else parent_tool_result
+
+    span_meta = {
+        "subagent_type": agent_type,
+        "subagent_id": agent_id,
+        "subagent_description": description,
+        "subagent_api_calls": len(asst_msgs),
+        "subagent_tool_calls": sum(len(get_tool_calls(m)) for m in asst_msgs),
+        "subagent_total_input_tokens": total_in,
+        "subagent_total_cache_read_tokens": total_cache_r,
+        "subagent_total_cache_creation_tokens": total_cache_c,
+        "subagent_total_output_tokens": total_out,
+        "subagent_record_count": len(records),
+        "subagent_transcript": str(transcript_path),
+    }
+
+    with langfuse.start_as_current_span(
+        name=f"Tool: Agent ({agent_type})",
+        input=redact(truncate(parent_tool_use.get("input"))),
+        output=redact(truncate(parent_output)),
+        metadata=span_meta,
+        level="ERROR" if is_error else None,
+        status_message="subagent reported error" if is_error else None,
+    ):
+        for i, asst_rec in enumerate(asst_msgs, start=1):
+            msg = asst_rec.get("message") or {}
+            usage_details = extract_usage_details(msg.get("usage") or {})
+            model_params = extract_model_parameters(msg)
+            tool_uses = get_tool_calls(asst_rec)
+            tool_use_summary = [{"name": t.get("name"), "id": t.get("id")} for t in tool_uses]
+
+            gen = langfuse.start_observation(
+                as_type="generation",
+                name=f"[{agent_type}] API call {i}/{len(asst_msgs)}",
+                model=msg.get("model") or "claude",
+                input={
+                    "anthropic_message_id": msg.get("id"),
+                    "tool_uses_planned": tool_use_summary,
+                },
+                output={
+                    "text": get_text_content(asst_rec),
+                    "stop_reason": msg.get("stop_reason"),
+                    "tool_uses": tool_use_summary,
+                },
+                model_parameters=model_params,
+                usage_details=usage_details,
+                metadata={
+                    "subagent_type": agent_type,
+                    "subagent_id": agent_id,
+                    "api_call_index": i,
+                    "stop_reason": msg.get("stop_reason"),
+                    "anthropic_message_id": msg.get("id"),
+                },
+            )
+            gen.end()
+
+        for asst_rec in asst_msgs:
+            for tu in get_tool_calls(asst_rec):
+                tool_name = tu.get("name", "unknown")
+                tool_id = tu.get("id", "")
+                raw_result = _find_tool_result(tool_id, tool_results)
+                tool_is_error = isinstance(raw_result, dict) and raw_result.get("_error") is True
+                with langfuse.start_as_current_span(
+                    name=f"[{agent_type}] Tool: {tool_name}",
+                    input=redact(truncate(tu.get("input"))),
+                    output=redact(truncate(raw_result)),
+                    metadata={
+                        "tool_name": tool_name,
+                        "tool_id": tool_id,
+                        "is_error": tool_is_error,
+                        "subagent_type": agent_type,
+                        "subagent_id": agent_id,
+                    },
+                    level="ERROR" if tool_is_error else None,
+                    status_message="tool reported error" if tool_is_error else None,
+                ):
+                    pass
+
+
+def _find_tool_result(tool_id: str, results: list) -> Any:
+    """Return the content of a tool_result for a given tool_use_id, or
+    {'_error': True, 'content': ...} when the result is marked is_error."""
+    for r in results:
+        c = get_content(r)
+        if not isinstance(c, list):
+            continue
+        for item in c:
+            if isinstance(item, dict) and item.get("tool_use_id") == tool_id:
+                payload = item.get("content")
+                if item.get("is_error"):
+                    return {"_error": True, "content": payload}
+                return payload
+    return None
+
 
 
 def extract_project_name(project_dir: Path) -> str:
@@ -387,6 +763,7 @@ def queue_turns_from_messages(
     session_id: str,
     turn_count: int,
     project_name: str,
+    transcript_path: str | None = None,
 ) -> int:
     """Parse messages into turns and queue them locally. Returns number of turns queued."""
     turns = 0
@@ -421,6 +798,7 @@ def queue_turns_from_messages(
                     "assistant_msgs": current_assistants,
                     "tool_results": current_tool_results,
                     "project_name": project_name,
+                    "transcript_path": transcript_path,
                 })
 
             current_user = msg
@@ -490,106 +868,163 @@ def create_trace(
     assistant_msgs: list,
     tool_results: list,
     project_name: str = "",
+    transcript_path: str | Path | None = None,
 ) -> None:
-    """Create a Langfuse trace for a single turn using the new SDK API."""
-    # Extract user text
+    """Create a Langfuse trace for a single turn (v2 schema).
+
+    Emits one GENERATION per assistant API call with real Anthropic-reported
+    usage (incl. cache tokens), expands Agent tool_use blocks into nested
+    subagent observations, marks errored tools at level=ERROR, and sets
+    user_id / release / semantic trace name.
+    """
     user_text = get_text_content(user_msg)
+    final_text = get_text_content(assistant_msgs[-1]) if assistant_msgs else ""
 
-    # Extract final assistant text
-    final_output = ""
-    if assistant_msgs:
-        final_output = get_text_content(assistant_msgs[-1])
+    trace_name = derive_trace_name(user_msg, turn_num)
+    release = derive_release(transcript_path)
+    user_id = getpass.getuser()
+    subagents = discover_subagents(transcript_path)
 
-    # Get model info from first assistant message
-    model = "claude"
-    if assistant_msgs and isinstance(assistant_msgs[0], dict) and "message" in assistant_msgs[0]:
-        model = assistant_msgs[0]["message"].get("model", "claude")
+    # Pre-compute trace-level totals/error counts for metadata
+    error_count = 0
+    for r in tool_results:
+        c = get_content(r)
+        if isinstance(c, list):
+            for item in c:
+                if isinstance(item, dict) and item.get("is_error"):
+                    error_count += 1
 
-    # Collect all tool calls and results
-    all_tool_calls = []
-    for assistant_msg in assistant_msgs:
-        tool_calls = get_tool_calls(assistant_msg)
-        for tool_call in tool_calls:
-            tool_name = tool_call.get("name", "unknown")
-            tool_input = tool_call.get("input", {})
-            tool_id = tool_call.get("id", "")
+    trace_meta: dict[str, Any] = {
+        "source": "claude-code",
+        "turn_number": turn_num,
+        "session_id": session_id,
+        "project": project_name,
+        "release": release,
+        "assistant_api_calls": len(assistant_msgs),
+        "tool_call_count": sum(len(get_tool_calls(m)) for m in assistant_msgs),
+        "tool_result_count": len(tool_results),
+        "subagent_count": len(subagents),
+    }
+    if error_count:
+        trace_meta["tool_error_count"] = error_count
+    if transcript_path:
+        trace_meta["transcript_path"] = str(transcript_path)
 
-            # Find matching tool result
-            tool_output = None
-            for tr in tool_results:
-                tr_content = get_content(tr)
-                if isinstance(tr_content, list):
-                    for item in tr_content:
-                        if isinstance(item, dict) and item.get("tool_use_id") == tool_id:
-                            tool_output = item.get("content")
-                            break
-
-            all_tool_calls.append({
-                "name": tool_name,
-                "input": tool_input,
-                "output": tool_output,
-                "id": tool_id,
-            })
-
-    # Build tags list
     tags = ["claude-code"]
     if project_name:
         tags.append(project_name)
 
-    # Create root span (implicitly creates a trace), then set trace-level attributes
     with langfuse.start_as_current_span(
-        name=f"Turn {turn_num}",
+        name=trace_name,
         input={"role": "user", "content": user_text},
-        metadata={
-            "source": "claude-code",
-            "turn_number": turn_num,
-            "project": project_name,
-        },
+        metadata=trace_meta,
+        level="ERROR" if error_count else None,
+        status_message=f"{error_count} tool error(s)" if error_count else None,
     ) as trace_span:
-        # Set session_id and tags on the underlying trace
         langfuse.update_current_trace(
+            name=trace_name,
             session_id=session_id,
+            user_id=user_id,
             tags=tags,
-            metadata={
-                "source": "claude-code",
-                "turn_number": turn_num,
-                "session_id": session_id,
-                "project": project_name,
-            },
+            version=release,
+            metadata=trace_meta,
+            input={"role": "user", "content": user_text},
+            output={"role": "assistant", "content": final_text},
         )
 
-        # Create generation for the LLM response
-        with langfuse.start_as_current_observation(
-            name="Claude Response",
-            as_type="generation",
-            model=model,
-            input={"role": "user", "content": user_text},
-            output={"role": "assistant", "content": final_output},
-            metadata={
-                "tool_count": len(all_tool_calls),
-            },
-        ):
-            pass
+        # ─── ONE GENERATION PER ASSISTANT API CALL ────────────────────────
+        for i, asst_rec in enumerate(assistant_msgs, start=1):
+            msg = asst_rec.get("message") if isinstance(asst_rec, dict) else None
+            msg = msg or {}
+            usage_details = extract_usage_details(msg.get("usage") or {})
+            model_params = extract_model_parameters(msg)
+            tool_uses = get_tool_calls(asst_rec)
+            tool_use_summary = [{"name": t.get("name"), "id": t.get("id")} for t in tool_uses]
 
-        # Create spans for tool calls
-        for tool_call in all_tool_calls:
-            with langfuse.start_as_current_span(
-                name=f"Tool: {tool_call['name']}",
-                input=tool_call["input"],
-                metadata={
-                    "tool_name": tool_call["name"],
-                    "tool_id": tool_call["id"],
+            level = None
+            status_message = None
+            if msg.get("stop_reason") in ("max_tokens", "refusal"):
+                level = "WARNING"
+                status_message = f"stop_reason={msg.get('stop_reason')}"
+
+            gen = langfuse.start_observation(
+                as_type="generation",
+                name=f"API call {i}/{len(assistant_msgs)}",
+                model=msg.get("model") or "claude",
+                input={
+                    "anthropic_message_id": msg.get("id"),
+                    "tool_uses_planned": tool_use_summary,
                 },
-            ) as tool_span:
-                tool_span.update(output=tool_call["output"])
-            debug(f"Created span for tool: {tool_call['name']}")
+                output={
+                    "text": get_text_content(asst_rec),
+                    "stop_reason": msg.get("stop_reason"),
+                    "tool_uses": tool_use_summary,
+                },
+                model_parameters=model_params,
+                usage_details=usage_details,
+                metadata={
+                    "api_call_index": i,
+                    "api_call_count": len(assistant_msgs),
+                    "tool_use_count": len(tool_uses),
+                    "tool_uses": tool_use_summary,
+                    "stop_reason": msg.get("stop_reason"),
+                    "anthropic_message_id": msg.get("id"),
+                },
+                level=level,
+                status_message=status_message,
+            )
+            gen.end()
+
+        # ─── TOOL CALLS as child spans (with subagent expansion) ─────────
+        for asst_rec in assistant_msgs:
+            for tu in get_tool_calls(asst_rec):
+                tool_name = tu.get("name", "unknown")
+                tool_id = tu.get("id", "")
+                raw_result = _find_tool_result(tool_id, tool_results)
+
+                # Subagent expansion: when tool is Agent, look up the matching
+                # subagent transcript by description and emit nested observations.
+                if tool_name == "Agent":
+                    desc = (tu.get("input") or {}).get("description", "")
+                    sub = subagents.get(desc) or next(
+                        (v for k, v in subagents.items() if k.startswith(f"{desc}#")),
+                        None,
+                    )
+                    if sub:
+                        try:
+                            emit_subagent_span(
+                                langfuse,
+                                subagent_info=sub,
+                                parent_tool_use=tu,
+                                parent_tool_result=raw_result,
+                            )
+                            continue
+                        except Exception as e:
+                            debug(f"subagent expansion failed for {desc!r}: {e}")
+                            # Fall through to leaf span
+
+                tool_is_error = isinstance(raw_result, dict) and raw_result.get("_error") is True
+                with langfuse.start_as_current_span(
+                    name=f"Tool: {tool_name}",
+                    input=redact(truncate(tu.get("input"))),
+                    output=redact(truncate(raw_result)),
+                    metadata={
+                        "tool_name": tool_name,
+                        "tool_id": tool_id,
+                        "is_error": tool_is_error,
+                    },
+                    level="ERROR" if tool_is_error else None,
+                    status_message="tool reported error" if tool_is_error else None,
+                ):
+                    pass
+                debug(f"Created span for tool: {tool_name}")
 
         # Add permission governance data
         perm_events = get_permission_flags(session_id)
         if perm_events:
             tags.append("has-permission-flags")
             langfuse.update_current_trace(tags=tags)
-            flag_summary = {}
+            flag_summary: dict[str, int] = {}
             for evt in perm_events:
                 for flag in evt.get("flags", []):
                     flag_summary[flag] = flag_summary.get(flag, 0) + 1
@@ -600,10 +1035,9 @@ def create_trace(
             ) as perm_span:
                 perm_span.update(output={"events": perm_events})
 
-        # Update trace with output
-        trace_span.update(output={"role": "assistant", "content": final_output})
+        trace_span.update(output={"role": "assistant", "content": final_text})
 
-    debug(f"Created trace for turn {turn_num}")
+    debug(f"Created trace for turn {turn_num} ({len(assistant_msgs)} API calls, {len(subagents)} subagents)")
 
 
 def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Path, state: dict, project_name: str = "") -> int:
@@ -662,7 +1096,7 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
             if current_user and current_assistants:
                 turns += 1
                 turn_num = turn_count + turns
-                create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results, project_name)
+                create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results, project_name, transcript_path=str(transcript_file))
 
             # Start new turn
             current_user = msg
@@ -700,7 +1134,7 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
     if current_user and current_assistants:
         turns += 1
         turn_num = turn_count + turns
-        create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results, project_name)
+        create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results, project_name, transcript_path=str(transcript_file))
 
     # Update state
     state[session_id] = {
@@ -776,7 +1210,8 @@ def main():
 
                 if new_messages:
                     turns_queued = queue_turns_from_messages(
-                        new_messages, session_id, turn_count, project_name
+                        new_messages, session_id, turn_count, project_name,
+                        transcript_path=str(transcript_file),
                     )
                     total_turns_queued += turns_queued
 
@@ -796,11 +1231,14 @@ def main():
         sys.exit(0)
 
     # Langfuse is available - initialize client
+    # Set OTel resource attribute so spans don't show as "unknown_service"
+    os.environ.setdefault("OTEL_SERVICE_NAME", SERVICE_NAME)
     try:
         langfuse = Langfuse(
             public_key=public_key,
             secret_key=secret_key,
             host=host,
+            release=derive_release(),
         )
     except Exception as e:
         log("ERROR", f"Failed to initialize Langfuse client: {e}")
