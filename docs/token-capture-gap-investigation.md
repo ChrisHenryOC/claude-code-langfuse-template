@@ -17,26 +17,38 @@
 
 ## TL;DR
 
-> [!warning] STATUS (2026-07-17): three defects fixed; **a fourth found by the FIRST LIVE run.**
-> Parts 1 + 2 shipped (`transcript_path` threaded; sweep-primary completion capture;
-> `message.id` merge). **Replay** claimed 100 % capture — but the first **live** `/research`
-> run (session `31fffe1a`) captured only **28/55 messages (51 %), 47 % tokens.** Merge is
-> confirmed live (rows/msg = 1.00 both paths, 0 dupes) and captured subagents are complete,
-> but **a whole turn was dropped — its parent gen AND its 3 subagents.** Verified: 44 parent
-> messages on disk, 42 in Langfuse; the two missing include `msg_…gsXJrb`, the reader turn's
-> own parent gen. So **Defect 4 = turns spanning a fire boundary are dropped (parent + subagents)**,
-> a general turn-loss bug that **predates all the async work** and was merely *exposed* by it:
-> `process_transcript` rebuilds `current_user` from scratch each fire but only sees
-> `[last_line→EOF]`, so a turn that opened on a user record (here a searcher task-notification)
-> consumed by an *earlier* fire has `current_user=None` → the finalize guard skips → `last_line`
-> advances past the whole turn. (My first-pass "agentId straddle / registration miss" was wrong —
-> the tool_use/spawn-ack were adjacent and resolvable; the turn never ran `create_trace` at all.)
-> **Fix (installed):** persist the open turn's user across fires (`open_user` in state), restore
-> next fire. Controlled replay at the 10 real fire boundaries: 28/55→**55/55**, 5/8→8/8 subagents,
-> parent gen recovered, 0 dupes. Also fixed the **queue-path clobber** (line ~1449) that wiped
-> `emitted`/`pending`/`open_user`. **Open:** live re-measure — the gate must now check
-> **parent-message parity too**, not just subagents. **Replay has overstated every time — only a
-> live run settles it.**
+> [!note] STATUS (2026-07-17): **RESOLVED.** Five defects found and fixed; live capture **95 %**
+> (parent + subagent balanced, 0 dupes), verified on a settled `/research` run — not a replay
+> claim. The async-Agent cliff is root-caused and version-pinned. This brief is now a **resolved
+> record**, not a live investigation; the forward question (native OTel vs. transcript parsing)
+> moved to its own tracked artifact, `otel-migration-test-plan.md`.
+>
+> **The five defects (all fixed + installed):**
+> 1. **Line-1137 no-`transcript_path` flush** — final-turn `create_trace` skipped subagent expansion.
+> 2. **Incomplete-file replay** → sweep-primary completion capture (`open_user` + quiescence/notification).
+> 3. **`emit_subagent_span` no `message.id` merge** — subagent gens/tokens inflated ~2.2–2.8×.
+> 4. **Turns spanning a fire boundary dropped (parent + subagents)** — `process_transcript` rebuilt
+>    `current_user` per fire; a turn opened on a user record an earlier fire consumed had
+>    `current_user=None` → finalize guard skipped it. A *general turn-loss* bug that **predated the
+>    async work** and was merely exposed by it. Fixed by persisting `open_user` in state (+ the
+>    queue-path clobber at line ~1449 that wiped `emitted`/`pending`/`open_user`).
+> 5. **`agent_id` prefix inconsistency** (commit `528c8d2`) — `discover_subagents` kept the
+>    `agent-` filename prefix while `subagent_by_id` used the bare id, double-keying one subagent
+>    (an exactly-once / notification-matching hazard). *Verified:* on session `0fa25040`, 7 subagents
+>    tagged with bare ids but `a1ff3c3b` tagged `agent-a1ff3c3bea612d480`; its 5 messages were
+>    captured, just mislabeled.
+>
+> **Two residuals remain, handed to `otel-migration-test-plan.md` (Phase 5 "if stay on hook"):**
+> not brief-blockers, and both are *artifacts of reconstructing from a passive file* that native
+> OTel would not have. (a) **60 s-quiescence truncation** — a subagent that goes quiescent > 60 s
+> mid-run is swept "complete," then loses any later message (e.g. synthesizer `a6448660` on
+> `0fa25040`: swept 18:59:39, wrote its real final message 18:59:53 → lost). Needs a completion-aware
+> check, not bare quiescence. (b) **A residual parent turn-cluster drop** (3 gens in one ~7 s turn,
+> 18:42) — the `open_user` fix doesn't fully close the parent-path turn-boundary edge.
+>
+> **Meta:** six confident reconstructions overstated across this investigation (matcher → race →
+> line 1137 → incomplete-file → async cliff → my "agentId straddle"). Every one was corrected only
+> by a controlled run. The lesson is load-bearing: **only a live run ever settled a claim here.**
 
 **Root cause (2026-07-16, after five revisions):** the dominant cause is a
 one-line defect, **not** the timing race the body of this brief was written around.
@@ -55,7 +67,9 @@ sibling turns 1/3/5 at the same epoch recorded `subagent_count = 7` — i.e. the
 files *were present*, and the Agent turns were dropped anyway because they took the
 line-1137 path. A controlled replay flipping only that keyword: **0 → 82** subagent gens.
 
-**There are THREE distinct defects; the line-1137 fix only addresses the first:**
+**There are THREE distinct defects here; the line-1137 fix only addresses the first**
+(two more — Defect 4 turn-loss and Defect 5 `agent_id` prefix — surfaced later on live runs;
+see the RESOLVED status banner at the top for the full five):
 
 1. **No-`transcript_path` flush (line 1137)** — the turns holding Agent tool_uses never
    *attempt* expansion. Fixed by threading `transcript_path` (one-liner). Ship first.
@@ -376,7 +390,8 @@ ran older builds). Pin any bisect to the **`version` field in the transcript**, 
 
 ## Remediation (for the maintainer)
 
-Matcher work is irrelevant; the parent emitter is correct. There are **three** defects.
+Matcher work is irrelevant; the parent emitter is correct. There are **three** defects known
+at this point in the investigation (Defects 4–5 came later — see the status banner).
 Ship part 1, verify capture reaches the *predicted* ~44 % (message count), then ship part 2
 **together with the Defect-3 merge** — they touch the same function and Defect 3 poisons the
 validation gate if left in.
