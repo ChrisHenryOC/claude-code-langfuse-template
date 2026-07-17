@@ -1253,6 +1253,14 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
     turn_count = session_state.get("turn_count", 0)
     emitted_ids = set(session_state.get("emitted_subagents") or [])
     pending_subagents = dict(session_state.get("pending_subagents") or {})
+    # The turn currently open at the end of the previous fire. A turn is
+    # user -> assistant(s), but fires process only [last_line -> EOF], so a long
+    # async turn's opening user message and its later assistant replies land in
+    # different fires. Without carrying the user forward, a fire that sees only
+    # the assistant side has current_user=None, the finalize guard skips it, and
+    # last_line advances past the whole turn — dropping its parent generation AND
+    # any subagents it spawned. Restoring it lets that fire finalize the turn.
+    open_user = session_state.get("open_user")
 
     # Read transcript
     lines = transcript_file.read_text().strip().split("\n")
@@ -1276,9 +1284,12 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
 
     debug(f"Processing {len(new_messages)} new messages")
 
-    # Group messages into turns (user -> assistant(s) -> tool_results)
+    # Group messages into turns (user -> assistant(s) -> tool_results).
+    # current_user starts from the turn left open by the previous fire, so
+    # assistant replies arriving in this fire are attributed to it rather than
+    # dropped (see open_user above).
     turns = 0
-    current_user = None
+    current_user = open_user
     current_assistants = []
     current_assistant_parts = []
     current_msg_id = None
@@ -1357,6 +1368,9 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
         "updated": datetime.now(timezone.utc).isoformat(),
         "emitted_subagents": sorted(emitted_ids),
         "pending_subagents": pending_subagents,
+        # Carry the still-open turn's user message to the next fire so its later
+        # assistant replies are not dropped. None once the turn closes.
+        "open_user": current_user,
     }
     save_state(state)
 
@@ -1431,11 +1445,18 @@ def main():
                     )
                     total_turns_queued += turns_queued
 
-                    # Update state even when queuing
+                    # Update state even when queuing. Preserve the subagent
+                    # bookkeeping and open turn unchanged — this degraded path
+                    # doesn't expand subagents, but it must not clobber what the
+                    # normal path tracked, or already-emitted subagents re-emit
+                    # (no upsert on SDK v3) and in-flight ones are stranded.
                     state[session_id] = {
                         "last_line": total_lines,
                         "turn_count": turn_count + turns_queued,
                         "updated": datetime.now(timezone.utc).isoformat(),
+                        "emitted_subagents": session_state.get("emitted_subagents", []),
+                        "pending_subagents": session_state.get("pending_subagents", {}),
+                        "open_user": session_state.get("open_user"),
                     }
             except Exception as e:
                 debug(f"Error queuing session {session_id}: {e}")
