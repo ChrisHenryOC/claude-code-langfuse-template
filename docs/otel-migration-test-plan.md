@@ -46,15 +46,61 @@
   the same searcher/reader/synthesizer subagent fan-out but has **no email side
   effect** and doesn't consume the day's briefing signals. Reserve one real
   `/briefing` for a realism check at the end.
-- **Blast radius.** Enabling telemetry is additive env vars in `settings.json`;
-  it does not alter the hook or normal operation and is reversed by removing the
-  vars. Rollback is in Phase 5.
-- **Consent gate.** Phases 1+ change the user's `settings.json` and generate real
-  telemetry. Do not enable until the user greenlights.
+- **Enable telemetry via shell-exported env, NOT global `settings.json`.**
+  `settings.json` env applies to *every* Claude Code session on the machine —
+  including the two collaborating sessions and any real briefing — so it can't be
+  scoped to the spike. Instead, `export` the OTEL vars in the terminal that
+  launches the test session; Claude Code inherits process env, so telemetry is
+  live only for that session's runs. Rollback is closing the terminal (Phase 5).
+- **Blast radius.** Telemetry is additive and read-only relative to the hook: it
+  does not alter the hook, the transcripts, or normal operation. The hook's 95%
+  baseline cannot be perturbed by it (isolation verified above).
+- **Consent gate.** Phases 1+ generate real telemetry and (for `/briefing`) real
+  email. Do not enable until the user greenlights.
+
+---
+
+## Execution roles & sessions — who runs what, from where
+
+Three distinct actors. Keep them separate; do not collapse them.
+
+- **Design/interpretation session** — the collaborating Claude thread(s) that hold
+  the hook + investigation context. **Owns:** reading raw results and rendering the
+  gate verdicts (pass/fail, is-this-a-regression, does-a-mismatch-mean-the-known-
+  bug). Does NOT run the telemetry workload. Interpretation needs the deep context
+  and nuance ("96% — pass or fail here?", "aggregate cache = regression"), which a
+  fresh session lacks.
+- **Test/execution session** — a **fresh, third Claude Code session** launched from
+  a terminal with the OTEL vars `export`ed (isolation per Ground rules). **Owns:**
+  running the workload and returning *raw* artifacts — the T/H/N tables, one sample
+  `llm_request` span's attributes, ClickHouse query output. It works purely from
+  THIS committed plan (self-contained by design), so it needs none of the
+  design-session context. It renders no verdicts; it reports numbers.
+- **Workload** — `claude -p /research` (or one `/briefing`) in the `llm-wiki`
+  project. This is the *subject under test*, spawned by the execution session, not
+  an actor that reasons.
+
+**When the third (execution) session is worth it, and when it isn't:**
+
+| Phase | Run from | Why |
+|---|---|---|
+| **Phase 0** (baseline) | **Design session** | Read-only queries + one config check; no telemetry; trivial. Not worth a separate session. |
+| **Phase 1** (cache-split pivot) | **Design session** | One `/research` run + one span inspection. Decisive and tiny — standing up a third session costs more than the work. The design session `export`s the OTEL vars in its own shell just for this run, then unsets them. |
+| **Phase 2** (dual-write grind) | **Third/execution session** | 3+ runs over days of repetitive querying — mechanical and voluminous. Offload it; keep the design threads clean. Returns raw T/H/N; design session interprets. |
+| **Phase 3** (residual correctness) | **Third/execution session** | Same runs as Phase 2, extra queries. Executes there; design session judges "fixed / same gap / different gap." |
+| **Phase 4** (hook regression suite) | **Design session** | Pure code/replay against the repo, no telemetry — belongs with whoever edits the hook. |
+| **Phase 5** (decision) | **Design session** | Judgment call over all gate results; interpretation, not execution. |
+
+**Handoff format (execution → design):** raw numbers only — per-session `T / H / N`
+with the disk denominator, one verbatim `llm_request` span's attribute map, and any
+query that returned unexpectedly. No verdicts from the execution session; that's the
+design session's job. This bounds the copy/paste to numbers-in, verdict-out.
 
 ---
 
 ## Phase 0 — Baseline & ground truth (no config change)
+
+**Executor: design session** (read-only, no telemetry).
 
 Establish the numbers everything else is measured against, before touching anything.
 
@@ -70,6 +116,9 @@ Exit criterion: three reference numbers exist — transcript truth, hook capture
 ---
 
 ## Phase 1 — The pivotal cheap gate: cache-tier granularity
+
+**Executor: design session** (`export`s the OTEL vars in its own shell for this one
+run, then unsets them — not worth a separate session for a single decisive run).
 
 This is the single fact that most likely decides the whole direction, and it costs
 one run. Do it before any multi-day investment.
@@ -103,6 +152,9 @@ cache tokens at all. A hard "no" here means stop and stay on the hook.
 ---
 
 ## Phase 2 — Dual-write reconciliation (the core test)
+
+**Executor: third/execution session** (OTEL vars shell-exported; returns raw T/H/N,
+design session interprets).
 
 Both writers run for 3 `/research` runs + 1 `/briefing`, into their separate
 projects. This is where "does it actually match truth" is answered.
@@ -138,6 +190,9 @@ Exit criterion: a per-session table of T/H/N with pass/fail on each gate.
 
 ## Phase 3 — Correctness & the residuals native should fix "for free"
 
+**Executor: third/execution session** (same runs as Phase 2, extra queries; design
+session judges "fixed / same gap / different gap").
+
 These test the specific failure modes that motivated the migration — the things
 native is *claimed* to solve by construction. If it doesn't solve them, the
 migration's main benefit evaporates.
@@ -165,6 +220,9 @@ gap / native has a different gap."
 ---
 
 ## Phase 4 — Hook regression suite (protect the 95% regardless of outcome)
+
+**Executor: design session** (pure code/replay against the repo, no telemetry;
+belongs with whoever edits the hook).
 
 The hook stays for backfill even if we migrate, so its correctness must be locked
 as repeatable tests, not one-off replays.
@@ -195,6 +253,9 @@ Exit criterion: `make test` (or equivalent) green; these run on every hook chang
 ---
 
 ## Phase 5 — Decision, rollout, rollback
+
+**Executor: design session** (judgment over all gate results; interpretation, not
+execution).
 
 **Decision matrix** (read gates from Phases 1–3):
 
