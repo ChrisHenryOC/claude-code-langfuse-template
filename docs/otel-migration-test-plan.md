@@ -1,7 +1,9 @@
 # Native OTel vs. transcript-hook — test plan
 
-> Status: DRAFT for two-Claude consensus. No config changed yet. Author: Claude
-> (opus). Companion to `token-capture-gap-investigation.md`.
+> Status: consensus reached (both collaborating sessions signed off); no config
+> changed yet. Author: Claude (opus), `claude-code-langfuse-template` session.
+> Companion to `token-capture-gap-investigation.md`. Session names used throughout
+> are defined in "Execution roles & sessions" below.
 >
 > **Question under test:** Can Claude Code's native OpenTelemetry (beta
 > `claude_code.llm_request` traces) replace the transcript-parsing hook for
@@ -62,45 +64,53 @@
 
 ## Execution roles & sessions — who runs what, from where
 
-Three distinct actors. Keep them separate; do not collapse them.
+Named Claude Code sessions, so it's unambiguous which is which:
 
-- **Design/interpretation session** — the collaborating Claude thread(s) that hold
-  the hook + investigation context. **Owns:** reading raw results and rendering the
-  gate verdicts (pass/fail, is-this-a-regression, does-a-mismatch-mean-the-known-
-  bug). Does NOT run the telemetry workload. Interpretation needs the deep context
-  and nuance ("96% — pass or fail here?", "aggregate cache = regression"), which a
-  fresh session lacks.
-- **Test/execution session** — a **fresh, third Claude Code session** launched from
-  a terminal with the OTEL vars `export`ed (isolation per Ground rules). **Owns:**
-  running the workload and returning *raw* artifacts — the T/H/N tables, one sample
-  `llm_request` span's attributes, ClickHouse query output. It works purely from
-  THIS committed plan (self-contained by design), so it needs none of the
-  design-session context. It renders no verdicts; it reports numbers.
-- **Workload** — `claude -p /research` (or one `/briefing`) in the `llm-wiki`
-  project. This is the *subject under test*, spawned by the execution session, not
-  an actor that reasons.
+- **`claude-code-langfuse-template`** — THIS session, anchored to the template repo
+  (`~/source/claude-code-langfuse-template`). **Owns:** the hook code and its
+  regression tests (Phase 4), the Langfuse/ClickHouse reconciliation queries, and
+  the interpretation/verdicts (pass/fail, is-this-a-regression, does-a-mismatch-mean-
+  the-known-bug). **Cannot run the workload** — `/research` and `/briefing` only
+  work from inside the `llm_wiki` project, and this session is in the wrong
+  directory. Docker/ClickHouse queries run fine from here (they're host-global).
+- **`llm_wiki`** — the other collaborating session, inside the `llm_wiki` project
+  (`~/llm_wiki`). **Owns:** the investigation brief, the transcript ground-truth
+  (`usage-report.py` lives here), and — because it's in the project — **running the
+  workload** (`/research`, `/briefing`). It holds deep context, so its thread is
+  worth keeping clean.
+- **`otel-spike`** (optional, to be created) — a **fresh** session launched from a
+  terminal **in the `llm_wiki` project dir** with the OTEL vars `export`ed. Exists
+  only to take the repetitive Phase 2/3 workload-running off `llm_wiki` so that
+  thread doesn't get polluted with dozens of runs. It works purely from THIS
+  committed plan (self-contained by design) and returns *raw* artifacts only — no
+  verdicts. **If you'd rather not run a third session, `llm_wiki` doubles as the
+  executor**; the only cost is a noisier brief thread.
 
-**When the third (execution) session is worth it, and when it isn't:**
+**Hard constraint:** anything that runs `/research` or `/briefing` must be a session
+in the `llm_wiki` project (`llm_wiki` or `otel-spike`). Anything that only queries
+Langfuse/ClickHouse or touches hook code runs from `claude-code-langfuse-template`.
 
 | Phase | Run from | Why |
 |---|---|---|
-| **Phase 0** (baseline) | **Design session** | Read-only queries + one config check; no telemetry; trivial. Not worth a separate session. |
-| **Phase 1** (cache-split pivot) | **Design session** | One `/research` run + one span inspection. Decisive and tiny — standing up a third session costs more than the work. The design session `export`s the OTEL vars in its own shell just for this run, then unsets them. |
-| **Phase 2** (dual-write grind) | **Third/execution session** | 3+ runs over days of repetitive querying — mechanical and voluminous. Offload it; keep the design threads clean. Returns raw T/H/N; design session interprets. |
-| **Phase 3** (residual correctness) | **Third/execution session** | Same runs as Phase 2, extra queries. Executes there; design session judges "fixed / same gap / different gap." |
-| **Phase 4** (hook regression suite) | **Design session** | Pure code/replay against the repo, no telemetry — belongs with whoever edits the hook. |
-| **Phase 5** (decision) | **Design session** | Judgment call over all gate results; interpretation, not execution. |
+| **Phase 0** (baseline) | `llm_wiki` (transcript truth) + `claude-code-langfuse-template` (Langfuse baseline, hook-version check) | Split: `usage-report.py` is in the llm_wiki project; the ClickHouse baseline and `diff` of the installed hook are host-global. No telemetry yet. |
+| **Phase 1** (cache-split pivot) | `llm_wiki` runs the one `/research` (OTEL vars exported in its shell); `claude-code-langfuse-template` inspects the span vs transcript | One decisive run + one span diff. Not worth a third session. `llm_wiki` unsets the vars after. |
+| **Phase 2** (dual-write grind) | `otel-spike` (or `llm_wiki` if avoiding a third session); `claude-code-langfuse-template` reconciles/interprets | 3+ runs over days of repetitive querying. Offload the runs; keep interpretation in `claude-code-langfuse-template`. |
+| **Phase 3** (residual correctness) | `otel-spike` / `llm_wiki` runs; `claude-code-langfuse-template` judges "fixed / same gap / different gap" | Same runs as Phase 2, extra queries. |
+| **Phase 4** (hook regression suite) | `claude-code-langfuse-template` | Pure code/replay against the repo, no telemetry — belongs with whoever edits the hook. |
+| **Phase 5** (decision) | `claude-code-langfuse-template` + `llm_wiki` (joint) | Judgment over all gate results; interpretation, not execution. |
 
-**Handoff format (execution → design):** raw numbers only — per-session `T / H / N`
-with the disk denominator, one verbatim `llm_request` span's attribute map, and any
-query that returned unexpectedly. No verdicts from the execution session; that's the
-design session's job. This bounds the copy/paste to numbers-in, verdict-out.
+**Handoff format (executor → `claude-code-langfuse-template`):** raw numbers only —
+per-session `T / H / N` with the disk denominator, one verbatim `llm_request` span's
+attribute map, and any query that returned unexpectedly. No verdicts from the
+executor; that's `claude-code-langfuse-template`'s job. This bounds the copy/paste to
+numbers-in, verdict-out.
 
 ---
 
 ## Phase 0 — Baseline & ground truth (no config change)
 
-**Executor: design session** (read-only, no telemetry).
+**Executor: `llm_wiki` (transcript truth) + `claude-code-langfuse-template`
+(Langfuse baseline, hook-version check).** Read-only, no telemetry.
 
 Establish the numbers everything else is measured against, before touching anything.
 
@@ -117,8 +127,9 @@ Exit criterion: three reference numbers exist — transcript truth, hook capture
 
 ## Phase 1 — The pivotal cheap gate: cache-tier granularity
 
-**Executor: design session** (`export`s the OTEL vars in its own shell for this one
-run, then unsets them — not worth a separate session for a single decisive run).
+**Executor: `llm_wiki` runs the one `/research`** (OTEL vars exported in its shell,
+unset after); **`claude-code-langfuse-template` inspects the span vs transcript.**
+Not worth a third session for a single decisive run.
 
 This is the single fact that most likely decides the whole direction, and it costs
 one run. Do it before any multi-day investment.
@@ -153,8 +164,8 @@ cache tokens at all. A hard "no" here means stop and stay on the hook.
 
 ## Phase 2 — Dual-write reconciliation (the core test)
 
-**Executor: third/execution session** (OTEL vars shell-exported; returns raw T/H/N,
-design session interprets).
+**Executor: `otel-spike`** (or `llm_wiki` if avoiding a third session) runs the
+workload; **`claude-code-langfuse-template` reconciles and interprets.**
 
 Both writers run for 3 `/research` runs + 1 `/briefing`, into their separate
 projects. This is where "does it actually match truth" is answered.
@@ -190,8 +201,8 @@ Exit criterion: a per-session table of T/H/N with pass/fail on each gate.
 
 ## Phase 3 — Correctness & the residuals native should fix "for free"
 
-**Executor: third/execution session** (same runs as Phase 2, extra queries; design
-session judges "fixed / same gap / different gap").
+**Executor: `otel-spike`/`llm_wiki`** runs (same runs as Phase 2, extra queries);
+**`claude-code-langfuse-template` judges** "fixed / same gap / different gap".
 
 These test the specific failure modes that motivated the migration — the things
 native is *claimed* to solve by construction. If it doesn't solve them, the
@@ -221,8 +232,8 @@ gap / native has a different gap."
 
 ## Phase 4 — Hook regression suite (protect the 95% regardless of outcome)
 
-**Executor: design session** (pure code/replay against the repo, no telemetry;
-belongs with whoever edits the hook).
+**Executor: `claude-code-langfuse-template`** (pure code/replay against the repo, no
+telemetry; belongs with whoever edits the hook).
 
 The hook stays for backfill even if we migrate, so its correctness must be locked
 as repeatable tests, not one-off replays.
@@ -254,8 +265,8 @@ Exit criterion: `make test` (or equivalent) green; these run on every hook chang
 
 ## Phase 5 — Decision, rollout, rollback
 
-**Executor: design session** (judgment over all gate results; interpretation, not
-execution).
+**Executor: `claude-code-langfuse-template` + `llm_wiki` (joint)** — judgment over
+all gate results; interpretation, not execution.
 
 **Decision matrix** (read gates from Phases 1–3):
 
