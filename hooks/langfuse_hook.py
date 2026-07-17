@@ -580,8 +580,12 @@ def discover_subagents(parent_transcript: Path | str | None) -> dict[str, dict]:
             meta = json.loads(meta_path.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        agent_id = meta_path.stem.removesuffix(".meta")
-        jsonl_path = subagent_dir / f"{agent_id}.jsonl"
+        # Bare id (no "agent-" prefix), so this matches the id parsed from the
+        # spawn-ack in subagent_by_id. A mismatch here double-keys the same
+        # subagent across the two resolution paths — breaking exactly-once,
+        # the subagent_id label, and <task-id> notification matching.
+        agent_id = meta_path.stem.removesuffix(".meta").removeprefix("agent-")
+        jsonl_path = subagent_dir / f"agent-{agent_id}.jsonl"
         if not jsonl_path.exists():
             continue
         desc = meta.get("description", "")
