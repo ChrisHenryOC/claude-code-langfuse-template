@@ -17,14 +17,26 @@
 
 ## TL;DR
 
-> [!note] STATUS (2026-07-16): root cause resolved; fix built, installed, and replay-verified.
-> Three defects, all understood (below). Parts 1 + 2 shipped (`transcript_path` threaded;
-> sweep-primary completion capture; `message.id` merge). Replay: subagent message capture
-> **13 % → 100 %**, emitted tokens == deduped disk (4.876M exact), 0 duplicates, re-sweep a
-> no-op. **Open:** re-measure the gate on a live briefing; purge the contaminated ClickHouse
-> rows. Getting here took **five** controlled corrections of confident narratives (matcher
-> mismatch → timing race → line 1137 → incomplete-file → the async cliff) — the arc is kept
-> below on purpose: each conclusion that skipped a controlled run was wrong.
+> [!warning] STATUS (2026-07-17): three defects fixed; **a fourth found by the FIRST LIVE run.**
+> Parts 1 + 2 shipped (`transcript_path` threaded; sweep-primary completion capture;
+> `message.id` merge). **Replay** claimed 100 % capture — but the first **live** `/research`
+> run (session `31fffe1a`) captured only **28/55 messages (51 %), 47 % tokens.** Merge is
+> confirmed live (rows/msg = 1.00 both paths, 0 dupes) and captured subagents are complete,
+> but **a whole turn was dropped — its parent gen AND its 3 subagents.** Verified: 44 parent
+> messages on disk, 42 in Langfuse; the two missing include `msg_…gsXJrb`, the reader turn's
+> own parent gen. So **Defect 4 = turns spanning a fire boundary are dropped (parent + subagents)**,
+> a general turn-loss bug that **predates all the async work** and was merely *exposed* by it:
+> `process_transcript` rebuilds `current_user` from scratch each fire but only sees
+> `[last_line→EOF]`, so a turn that opened on a user record (here a searcher task-notification)
+> consumed by an *earlier* fire has `current_user=None` → the finalize guard skips → `last_line`
+> advances past the whole turn. (My first-pass "agentId straddle / registration miss" was wrong —
+> the tool_use/spawn-ack were adjacent and resolvable; the turn never ran `create_trace` at all.)
+> **Fix (installed):** persist the open turn's user across fires (`open_user` in state), restore
+> next fire. Controlled replay at the 10 real fire boundaries: 28/55→**55/55**, 5/8→8/8 subagents,
+> parent gen recovered, 0 dupes. Also fixed the **queue-path clobber** (line ~1449) that wiped
+> `emitted`/`pending`/`open_user`. **Open:** live re-measure — the gate must now check
+> **parent-message parity too**, not just subagents. **Replay has overstated every time — only a
+> live run settles it.**
 
 **Root cause (2026-07-16, after five revisions):** the dominant cause is a
 one-line defect, **not** the timing race the body of this brief was written around.
@@ -112,7 +124,35 @@ The sweep + `message.id` merge were built and installed; replay verification:
 | duplicates | **0** |
 | second sweep | **no-op** |
 
-Repo tests pass; live hook ran clean end-to-end. Two limitations to record:
+Repo tests pass; live hook ran clean end-to-end. **But replay ≠ live:**
+
+> [!warning] First LIVE run (session `31fffe1a`, v2.1.212) — 51 %, not 100 %
+>
+> | check | live result |
+> |---|---|
+> | subagent message capture | **28/55 = 51 %** |
+> | token capture vs deduped disk (3.257M) | 1.535M = **47 %** |
+> | rows/msg parent / subagent | 1.00 / 1.00 ✓ (merge holds live) |
+> | duplicates | 0 ✓ |
+> | captured subagents | complete (2/2, 5/5, 7/7, 12/12, 2/2) ✓ |
+>
+> **A whole turn was dropped — parent gen AND its 3 subagents** (the reader batch "Extract
+> source cards A/B/C"). Verified: 44 parent messages on disk vs 42 in Langfuse; the two missing
+> include `msg_…gsXJrb`, the reader turn's own parent gen. So this is **general turn-loss, not
+> subagent-specific**, and it **predates all the async/sweep work** — async only exposed it.
+>
+> **Defect 4 — turns spanning a fire boundary are dropped.** `process_transcript` rebuilds
+> `current_user` from scratch each fire but only sees `[last_line→EOF]`; a turn that opened on a
+> user record (here a searcher task-notification) already consumed by an earlier fire has
+> `current_user=None` → the `if current_user and current_assistants` finalize guard skips it →
+> `last_line` advances past the entire turn. (An earlier draft here blamed an "agentId straddle /
+> registration miss" — **wrong**: the tool_use/spawn-ack were adjacent and resolvable; the turn
+> never ran `create_trace` at all.) **Fix (installed):** persist the open turn's user across fires
+> (`open_user` in state). Replay at the 10 real fire boundaries: 28/55→**55/55**, parent gen
+> recovered, 0 dupes. Also fixed: the queue-path state write (line ~1449) that wiped
+> `emitted`/`pending`/`open_user`. Live re-measure pending — **check parent-message parity too.**
+
+Two further limitations to record:
 
 > [!note] Scope + tuning caveats
 > - **New sessions only.** The sweep helps sessions going forward; sessions whose Agent turns
