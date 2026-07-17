@@ -78,24 +78,25 @@ Named Claude Code sessions, so it's unambiguous which is which:
   (`usage-report.py` lives here), and — because it's in the project — **running the
   workload** (`/research`, `/briefing`). It holds deep context, so its thread is
   worth keeping clean.
-- **`otel-spike`** (optional, to be created) — a **fresh** session launched from a
-  terminal **in the `llm_wiki` project dir** with the OTEL vars `export`ed. Exists
-  only to take the repetitive Phase 2/3 workload-running off `llm_wiki` so that
-  thread doesn't get polluted with dozens of runs. It works purely from THIS
+- **`otel-spike`** (to be created — the **execution session**, decided 2026-07-17)
+  — a **fresh** session launched from a terminal **in the `llm_wiki` project dir**
+  with the OTEL vars `export`ed. It runs the repetitive Phase 2/3 workload so that
+  neither collaborating thread (`llm_wiki`'s brief, `claude-code-langfuse-template`'s
+  hook context) gets polluted with dozens of runs. It works purely from THIS
   committed plan (self-contained by design) and returns *raw* artifacts only — no
-  verdicts. **If you'd rather not run a third session, `llm_wiki` doubles as the
-  executor**; the only cost is a noisier brief thread.
+  verdicts.
 
 **Hard constraint:** anything that runs `/research` or `/briefing` must be a session
-in the `llm_wiki` project (`llm_wiki` or `otel-spike`). Anything that only queries
-Langfuse/ClickHouse or touches hook code runs from `claude-code-langfuse-template`.
+in the `llm_wiki` project (`llm_wiki` for the single Phase-1 run, `otel-spike` for
+the Phase 2/3 grind). Anything that only queries Langfuse/ClickHouse or touches hook
+code runs from `claude-code-langfuse-template`.
 
 | Phase | Run from | Why |
 |---|---|---|
 | **Phase 0** (baseline) | `llm_wiki` (transcript truth) + `claude-code-langfuse-template` (Langfuse baseline, hook-version check) | Split: `usage-report.py` is in the llm_wiki project; the ClickHouse baseline and `diff` of the installed hook are host-global. No telemetry yet. |
 | **Phase 1** (cache-split pivot) | `llm_wiki` runs the one `/research` (OTEL vars exported in its shell); `claude-code-langfuse-template` inspects the span vs transcript | One decisive run + one span diff. Not worth a third session. `llm_wiki` unsets the vars after. |
-| **Phase 2** (dual-write grind) | `otel-spike` (or `llm_wiki` if avoiding a third session); `claude-code-langfuse-template` reconciles/interprets | 3+ runs over days of repetitive querying. Offload the runs; keep interpretation in `claude-code-langfuse-template`. |
-| **Phase 3** (residual correctness) | `otel-spike` / `llm_wiki` runs; `claude-code-langfuse-template` judges "fixed / same gap / different gap" | Same runs as Phase 2, extra queries. |
+| **Phase 2** (dual-write grind) | `otel-spike` runs; `claude-code-langfuse-template` reconciles/interprets | 3+ runs over days of repetitive querying. Offload the runs; keep interpretation in `claude-code-langfuse-template`. |
+| **Phase 3** (residual correctness) | `otel-spike` runs; `claude-code-langfuse-template` judges "fixed / same gap / different gap" | Same runs as Phase 2, extra queries. |
 | **Phase 4** (hook regression suite) | `claude-code-langfuse-template` | Pure code/replay against the repo, no telemetry — belongs with whoever edits the hook. |
 | **Phase 5** (decision) | `claude-code-langfuse-template` + `llm_wiki` (joint) | Judgment over all gate results; interpretation, not execution. |
 
@@ -164,8 +165,8 @@ cache tokens at all. A hard "no" here means stop and stay on the hook.
 
 ## Phase 2 — Dual-write reconciliation (the core test)
 
-**Executor: `otel-spike`** (or `llm_wiki` if avoiding a third session) runs the
-workload; **`claude-code-langfuse-template` reconciles and interprets.**
+**Executor: `otel-spike`** runs the workload; **`claude-code-langfuse-template`
+reconciles and interprets.**
 
 Both writers run for 3 `/research` runs + 1 `/briefing`, into their separate
 projects. This is where "does it actually match truth" is answered.
@@ -201,7 +202,7 @@ Exit criterion: a per-session table of T/H/N with pass/fail on each gate.
 
 ## Phase 3 — Correctness & the residuals native should fix "for free"
 
-**Executor: `otel-spike`/`llm_wiki`** runs (same runs as Phase 2, extra queries);
+**Executor: `otel-spike`** runs (same runs as Phase 2, extra queries);
 **`claude-code-langfuse-template` judges** "fixed / same gap / different gap".
 
 These test the specific failure modes that motivated the migration — the things
