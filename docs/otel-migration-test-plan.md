@@ -41,24 +41,55 @@
 - **No Langfuse SDK/skill install.** Native OTel is pure env-var config of Claude
   Code's own exporter. The Langfuse "AI skill" onboarding prompt is for
   SDK-instrumenting an application's code and is not used here.
-- **Auth:** Langfuse OTLP uses HTTP Basic auth —
-  `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(public_key:secret_key)>"`.
-  The key pair alone selects the project.
 - **Use `/research`, not `/briefing`, for controlled runs.** `/research` spawns
   the same searcher/reader/synthesizer subagent fan-out but has **no email side
   effect** and doesn't consume the day's briefing signals. Reserve one real
   `/briefing` for a realism check at the end.
-- **Enable telemetry via shell-exported env, NOT global `settings.json`.**
-  `settings.json` env applies to *every* Claude Code session on the machine —
-  including the two collaborating sessions and any real briefing — so it can't be
-  scoped to the spike. Instead, `export` the OTEL vars in the terminal that
-  launches the test session; Claude Code inherits process env, so telemetry is
-  live only for that session's runs. Rollback is closing the terminal (Phase 5).
+- **Enable telemetry per-session in the shell, never in `settings.json`.** The
+  exact commands are in "Enabling & disabling native telemetry" below — that block
+  is the *single* source of truth; phases reference it rather than re-specifying it.
+  Global `settings.json` would turn telemetry on for *every* session on the machine,
+  so it can't be scoped to the spike; shell-exported env applies only to the one
+  session launched from that terminal, and rollback is just closing it.
 - **Blast radius.** Telemetry is additive and read-only relative to the hook: it
   does not alter the hook, the transcripts, or normal operation. The hook's 95%
   baseline cannot be perturbed by it (isolation verified above).
 - **Consent gate.** Phases 1+ generate real telemetry and (for `/briefing`) real
   email. Do not enable until the user greenlights.
+
+---
+
+## Enabling & disabling native telemetry (the one place this is specified)
+
+Telemetry is turned on **only in the shell of the session that runs the workload**
+(`llm_wiki` for the single Phase-1 run, `otel-spike` for Phase 2/3) — never in
+`settings.json`. It stays off everywhere else on the machine. Keys already exist at
+`~/llm_wiki/.env.claude-code-otel` (Langfuse project `claude-code-otel`).
+
+**Enable** — in the terminal, in the `~/llm_wiki` project dir, *before* launching
+`claude`:
+
+```bash
+set -a; . ~/llm_wiki/.env.claude-code-otel; set +a   # LANGFUSE_PUBLIC_KEY / _SECRET_KEY / _BASE_URL
+export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1          # beta llm_request trace spans
+export OTEL_TRACES_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT="$LANGFUSE_BASE_URL/api/public/otel"
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic $(printf '%s:%s' "$LANGFUSE_PUBLIC_KEY" "$LANGFUSE_SECRET_KEY" | base64 | tr -d '\n')"
+claude          # this session (and only this one) now emits native traces
+```
+
+**Disable / rollback** — close that terminal, or in it:
+
+```bash
+unset CLAUDE_CODE_ENABLE_TELEMETRY CLAUDE_CODE_ENHANCED_TELEMETRY_BETA \
+      OTEL_TRACES_EXPORTER OTEL_EXPORTER_OTLP_PROTOCOL \
+      OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_HEADERS
+```
+
+Nothing persistent is touched, so there is no config to revert — the hook and every
+other session are unaffected the entire time.
 
 ---
 
@@ -115,14 +146,23 @@ numbers-in, verdict-out.
 
 Establish the numbers everything else is measured against, before touching anything.
 
-1. **Confirm hook is the shipped version** → verify: `diff ~/.claude/hooks/langfuse_hook.py hooks/langfuse_hook.py` is empty; `git log --oneline -1` shows the Defect-4 commit.
-2. **Pick a fixed test window** (e.g. `2026-07-18 00:00` → `2026-07-21 00:00`), written into every query below as a literal → verify: same two timestamps appear in the transcript-side and Langfuse-side commands.
-3. **Ground-truth token/cost** for the window from transcripts → `python3 ~/llm_wiki/scripts/usage-report.py --since 2026-07-18 --json` → verify: deduped (script header says "deduped by message.id"); record `tokens` and `cost` per bucket as the denominator.
-4. **Baseline hook capture** in Langfuse for the window, deduped by `anthropic_message_id` → verify: record `distinct_msgs` and summed `usage_details` tokens; note any raw-vs-distinct gap (leftover dup rows from earlier reprocessing) so it isn't mistaken for a capture change.
-5. **Dedicated native-OTel Langfuse project** (`claude-code-otel`), capture its public/secret keys → verify: `curl` the OTLP endpoint with the new key's Basic auth returns 2xx/4xx (reachable, authenticated), and the project shows 0 traces (clean slate).
-6. **Pre-flight isolation check** — after enabling native telemetry (Phase 1), fire the hook once and confirm hook traces still land in the **old** `claude-code` project, and native spans land only in `claude-code-otel` → verify: each project's new traces come from exactly one source (no hook traces in the native project, no native spans in the hook project). This empirically confirms the SDK/env-var isolation noted in Ground rules.
+A note on windows, since it's easy to trip on: there are **two** of them.
+- *This* phase measures **already-existing** data, so it uses a **recent, already-
+  closed** window — e.g. the last completed day or two that has subagent activity.
+  Nothing here is in the future.
+- Phase 2's comparison uses a **different** window that brackets the test runs you
+  do *then* — you record the wall-clock time just before the first run and just
+  after the last, and use those two literals. That window is "absolute" (fixed
+  timestamps, never `now() - N DAY`) but it is pinned *after* the runs happen, not
+  chosen ahead of time.
 
-Exit criterion: three reference numbers exist — transcript truth, hook capture, and an empty native project ready to receive.
+1. **Confirm hook is the shipped version** → verify: `diff ~/.claude/hooks/langfuse_hook.py hooks/langfuse_hook.py` is empty; `git log --oneline -1` on `main` shows the Defect-5 commit (`528c8d2`).
+2. **Fix the baseline window to a recent closed period** (e.g. yesterday `00:00`→`24:00` in a literal timestamp pair), used verbatim in steps 3–4 → verify: the same two literals appear in the transcript-side and Langfuse-side commands.
+3. **Ground-truth token/cost** for that window from transcripts → `python3 ~/llm_wiki/scripts/usage-report.py --since <start> --json` → verify: deduped (script header says "deduped by message.id"); record `tokens`/`cost` per bucket as the denominator.
+4. **Baseline hook capture** in Langfuse for the same window, deduped by `anthropic_message_id` → verify: record `distinct_msgs` and summed `usage_details` tokens; note any raw-vs-distinct gap (leftover dup rows from earlier reprocessing) so it isn't mistaken for a capture change. Sanity: this should land near the known ~95%.
+5. **Confirm the native project is reachable and empty** — keys already exist at `~/llm_wiki/.env.claude-code-otel` (project `claude-code-otel`); no telemetry enabled yet → verify: `curl` the OTLP endpoint with that key pair's Basic auth returns 2xx/4xx (reachable, authenticated), and the project shows 0 traces (clean slate).
+
+Exit criterion: three reference numbers exist — transcript truth, hook capture (~95%), and an empty native project ready to receive.
 
 ---
 
@@ -135,14 +175,16 @@ Not worth a third session for a single decisive run.
 This is the single fact that most likely decides the whole direction, and it costs
 one run. Do it before any multi-day investment.
 
-1. **Enable native telemetry** (dedicated project) → add to `settings.json` env:
-   `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`,
-   `OTEL_TRACES_EXPORTER=otlp`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`,
-   `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3000/api/public/otel`,
-   `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(pk:sk)>"` → verify:
-   a fresh `claude -p` run produces at least one `claude_code.llm_request` span in
-   the new project.
-2. **Inspect one `llm_request` span's token attributes and diff against the same
+1. **Enable telemetry in this session's shell** — run the "Enable" block from
+   "Enabling & disabling native telemetry" above, then launch `claude` from that
+   same terminal and do one `/research` run → verify: it produces at least one
+   `claude_code.llm_request` span in the `claude-code-otel` project.
+2. **Pre-flight isolation check** (moved here because it needs telemetry on) → the
+   `/research` run also fired the hook, so confirm the two writers didn't cross-wire:
+   hook traces still land in the **old** `claude-code` project, native spans land
+   **only** in `claude-code-otel` → verify: each project's new traces come from
+   exactly one source. Empirically confirms the SDK/env isolation from Ground rules.
+3. **Inspect one `llm_request` span's token attributes and diff against the same
    call's transcript** → the transcript's `message.usage.cache_creation` already
    carries `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` (verified
    baseline; the hook prices 5m at 1.25× base and 1h at 2× via
@@ -153,10 +195,12 @@ one run. Do it before any multi-day investment.
      is a **known cost-accuracy regression**; record the magnitude and take the
      "migrate for structure, keep hook for pricing" branch in Phase 5. This may
      end the full-migration case on its own.
-3. **Confirm subagent attribution exists** on the same run → verify:
+4. **Confirm subagent attribution exists** on the same run → verify:
    `claude_code.token.usage` metrics (or span attributes) carry `query_source`
    ∈ {main, subagent, auxiliary} and `agent.name`, and a subagent run shows
    `query_source=subagent`.
+5. **Tear down** — run the "Disable / rollback" block (or just close the terminal).
+   Nothing persistent was changed, so this fully reverts the config.
 
 Exit criterion: we know whether native telemetry can express per-call, per-tier
 cache tokens at all. A hard "no" here means stop and stay on the hook.
@@ -292,9 +336,10 @@ completion signal), verify: the `a6448660`-style late-final-message is captured;
 (b) close the turn-cluster parent-drop, verify: the 18:42-style cluster is
 captured on replay.
 
-**Rollback (either way, if the spike misbehaves):** remove the telemetry env vars
-from `settings.json`; the dedicated Langfuse project can be left dormant or
-deleted. The hook is unaffected throughout — it never depended on any of this.
+**Rollback (either way, if the spike misbehaves):** run the "Disable / rollback"
+block or close the test session's terminal — nothing persistent was changed, so
+there is no config to revert. The `claude-code-otel` project can be left dormant or
+deleted. The hook is unaffected throughout; it never depended on any of this.
 
 ---
 
