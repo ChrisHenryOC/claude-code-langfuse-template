@@ -210,6 +210,30 @@ one run. Do it before any multi-day investment.
 Exit criterion: we know whether native telemetry can express per-call, per-tier
 cache tokens at all. A hard "no" here means stop and stay on the hook.
 
+**RAN 2026-07-17 (session `089e4a80`, `/research` on a fresh topic) — GATE 1a: FAIL
+(aggregate only).** The `claude_code.llm_request` span carries `input_tokens`,
+`output_tokens`, `cache_read_tokens`, and **`cache_creation_tokens` as a single
+aggregate — no `ephemeral_5m`/`ephemeral_1h` split anywhere** (confirmed across all
+spans via `JSONExtractKeys`). This workload's cache creation is **100 % 1h**
+(107,481 tokens, 0 5m) — priced 2× vs 1.25× — so the missing split is a concrete
+pricing regression, not a theoretical one. Per the Phase-5 matrix this is the
+"migrate for structure, keep hook for pricing" branch.
+
+Two more findings from the same run:
+- **Attribution works, but under different names than the docs.** Subagent calls
+  carry `llm_request.context="tool"` + a populated `agent_id`; main-loop calls are
+  `context="interaction"` with empty `agent_id`. The documented `query_source` /
+  `agent.name` live on the *metrics* (`claude_code.token.usage`), which this run did
+  **not** export (only `OTEL_TRACES_EXPORTER=otlp` was set). So trace-level
+  attribution is present via `context`/`agent_id`.
+- **Integration gap — Langfuse `usage_details` is EMPTY on native spans.** Langfuse
+  maps `gen_ai.usage.*` OTel conventions; Claude Code emits `input_tokens` /
+  `cache_creation_tokens` etc., which Langfuse does not auto-map. So out of the box
+  native spans show **no tokens and no cost** in Langfuse — the numbers sit only in
+  the raw `attributes` JSON. Using native for cost needs a custom attribute-mapping
+  step, on top of the missing cache split. This *raises* the cost of even the
+  "migrate for structure" branch.
+
 ---
 
 ## Phase 2 — Dual-write reconciliation (the core test)
@@ -299,13 +323,16 @@ as repeatable tests, not one-off replays.
 3. **Queue-path state-preservation test** — simulate a fire on the
    Langfuse-unreachable path with existing `emitted_subagents`/`pending_subagents`/
    `open_user` in state → verify: all three survive the state write unchanged.
-4. **Native span-schema assertion** — pin the expected `claude_code.llm_request`
-   attribute names (token fields incl. the cache-tier breakdown, `query_source`,
-   `agent.name`) in a test that reads one recent native span → verify: the
-   attributes exist under the expected names. Native traces are beta ("span names
-   and attributes may change between releases"); a silent CC attribute rename must
-   fail this assertion, not be assumed away — the same drift class that broke the
-   transcript hook.
+4. **Native span-schema assertion** — pin the **observed** (2026-07-17)
+   `claude_code.llm_request` attribute names, which live in the span's raw
+   `attributes` JSON, NOT in Langfuse `usage_details`: `input_tokens`,
+   `output_tokens`, `cache_read_tokens`, `cache_creation_tokens` (aggregate — no
+   5m/1h), `llm_request.context` (`interaction`/`tool`), `agent_id`. → verify: the
+   attributes exist under these names. Native traces are beta ("span names and
+   attributes may change between releases"); a silent CC rename must fail this
+   assertion, not be assumed away — the same drift class that broke the transcript
+   hook. (The documented `query_source`/`agent.name` are metrics attributes, a
+   separate export path.)
 5. **Existing suite** → verify: `pytest tests/test_hook_unit.py` and
    `tests/test_syntax.sh` pass; installed copy byte-identical to repo.
 
