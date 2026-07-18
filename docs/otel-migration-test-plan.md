@@ -162,7 +162,12 @@ A note on windows, since it's easy to trip on: there are **two** of them.
 4. **Baseline hook capture** in Langfuse for the same window, deduped by `anthropic_message_id` → verify: record `distinct_msgs` and summed `usage_details` tokens; note any raw-vs-distinct gap (leftover dup rows from earlier reprocessing) so it isn't mistaken for a capture change. Sanity: this should land near the known ~95%.
 5. **Confirm the native project is reachable and empty** — keys already exist at `~/llm_wiki/.env.claude-code-otel` (project `claude-code-otel`); no telemetry enabled yet → verify: `curl` the OTLP endpoint with that key pair's Basic auth returns 2xx/4xx (reachable, authenticated), and the project shows 0 traces (clean slate).
 
-Exit criterion: three reference numbers exist — transcript truth, hook capture (~95%), and an empty native project ready to receive.
+Exit criterion: three reference numbers exist — transcript truth, hook capture
+(~95%), and an empty native project ready to receive. **Ran 2026-07-17:** native
+project clean (0/0); transcript tool validated; hook baseline confirmed **per
+session** (`0fa25040` 95 %, `a3b656eb` 89 %). Key finding — hook `start_time` is
+emission time, so all reconciliation must be **by `session_id`, not time window**
+(see Measurement mechanics).
 
 ---
 
@@ -350,9 +355,21 @@ deleted. The hook is unaffected throughout; it never depended on any of this.
 - **Dedup, always:** `uniqExact(metadata['anthropic_message_id'])` for the hook;
   distinct call/span id for native. Report raw-vs-distinct so silent duplication
   is visible.
-- **Fixed windows:** literal `start_time >= '2026-07-18 00:00:00' AND start_time <
-  '2026-07-21 00:00:00'` on the Langfuse side; `--since 2026-07-18` (and window
-  end) on the transcript side. No relative intervals.
+- **Slice by `session_id`, NOT by time window** (Phase-0 finding, 2026-07-17). The
+  hook stamps a generation's `start_time` at *emission*, not API-call time
+  (verified: `start_day == ingest_day` for every hook gen), so a `start_time`
+  window silently sweeps in historical re-emissions — a "since 2026-07-16" window
+  read 376 M hook tokens against 159 M of transcript truth purely from the earlier
+  reprocessing. Reconcile each session by `metadata['session_id']` (hook) /
+  `session.id` (native) / the session's transcript files (truth). Per session the
+  numbers are sane: `0fa25040` = 95 % (95/100 msgs), `a3b656eb` = 89 % (186/209,
+  a long interactive session hitting the known residuals). Time-windowing is only
+  safe for native, whose `start_time` is real API time — but slice it by session
+  too, so all three sides compare the same population.
 - **`FINAL` on every ClickHouse read** (ReplacingMergeTree).
+- **Purge the re-emission duplicates before trusting aggregates.** The
+  investigation's reprocessing left duplicate rows keyed by distinct observation id
+  but same `anthropic_message_id`; per-session dedup-by-message-id hides them, but
+  any cross-session aggregate is contaminated until they're purged.
 - **Token definition:** input + output + all cache tiers, excluding the derived
   `total` key — identical on all three sides so the ratios mean something.
