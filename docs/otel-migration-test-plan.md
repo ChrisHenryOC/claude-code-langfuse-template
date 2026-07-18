@@ -234,6 +234,49 @@ Two more findings from the same run:
   step, on top of the missing cache split. This *raises* the cost of even the
   "migrate for structure" branch.
 
+### Phase 1, judged against the actual goal — accurate *per-project total cost* (not per-conversation)
+
+Free 3-way reconciliation on `089e4a80` (run complete, native settled — stable 109,
+no new spans for >2 min):
+
+| source | calls | tokens | cost in Langfuse | groups by folder? | cache tiers? |
+|---|--:|--:|--:|:--:|:--:|
+| **T** transcript truth | 72 | 6.49 M | — | — | yes (5m/1h) |
+| **H** hook | 71 | 6.44 M (99 %) | **$8.25, all 71 priced** | **yes** (`project=llm-wiki`) | **yes** |
+| **N** native | 109 | 8.40 M (129 %) | **$0** (unpriced) | **no** | no (aggregate) |
+
+- **Native > truth is real, not a bug.** All 109 are distinct successful requests
+  (`attempt=1`, 0 retries). Native spans *every* API request, incl. ≥12 cheap
+  `haiku` auxiliary calls (title-gen etc.) that never become conversation turns. So
+  native is genuinely **more complete on raw API volume**; the hook is precise but
+  conversation-scoped and *structurally* can't see auxiliary calls (they aren't in
+  transcripts).
+- **Native cannot do per-project cost.** No cwd / dir / repo / project attribute
+  anywhere on the span; resourceAttributes are only `service.name=claude-code` + OS.
+  It can group by session / user / model, **not by folder.** The hook derives the
+  project from the transcript cwd and tags the trace (`llm-wiki`), so per-folder
+  grouping already works.
+- **What "empty `usage_details` → no cost" actually costs you.** Langfuse computes
+  cost by reading a span's `usage_details` token map × its model price table. Native
+  spans have `usage_details = {}`, so **every native span reads $0** in Langfuse's
+  cost UI, dashboards, and aggregates — the tokens exist only in the raw attributes
+  JSON the cost engine doesn't read. To get cost you must either (a) run an
+  OpenTelemetry Collector between Claude Code and Langfuse that renames the token
+  attributes to the `gen_ai.usage.*` names Langfuse maps, or (b) compute cost
+  yourself from the raw attributes with a price table. Both are real engineering,
+  not a config toggle. The hook populates `usage_details` and Langfuse prices it
+  automatically — the $8.25 above is live, no extra work.
+
+**Decision for this goal: stay on the hook.** For accurate per-project total cost,
+native trades **three regressions** (no folder grouping, $0 in Langfuse without a
+collector build, coarse cache) for **one gain** (captures auxiliary calls the hook
+can't). The hook already delivers per-folder, auto-priced, cache-correct cost today;
+its only gap is auxiliary API calls, which are structurally invisible to any
+transcript reader and are dominated by cheap haiku. If total spend must include those
+auxiliary calls, that specifically requires the native + OTel-collector build — worth
+weighing only if the auxiliary slice proves material (haiku here was ~0.13 M tokens,
+negligible cost). Phase 2/3 (the dual-write grind) is **not** warranted for this goal.
+
 ---
 
 ## Phase 2 — Dual-write reconciliation (the core test)
